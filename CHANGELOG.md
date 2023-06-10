@@ -1,5 +1,15 @@
 # Change Log
 
+## 1.10.1
+
+### Patch Changes
+
+- Pass method logLevel to LogExtension instead of configured logLevel - [#730](https://github.com/livekit/client-sdk-js/pull/730) ([@lukasIO](https://github.com/lukasIO))
+
+- Fix svc encodings for safari and chrome before 113 - [#731](https://github.com/livekit/client-sdk-js/pull/731) ([@cnderrauber](https://github.com/cnderrauber))
+
+- Always catch reconnectFuture rejections - [#727](https://github.com/livekit/client-sdk-js/pull/727) ([@HermanBilous](https://github.com/HermanBilous))
+
 ## 1.10.0
 
 ### Minor Changes
