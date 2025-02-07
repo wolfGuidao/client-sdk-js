@@ -1,40 +1,59 @@
+import { Mutex } from '@livekit/mutex';
+import {
+  ChatMessage as ChatMessageModel,
+  ConnectionQualityUpdate,
+  type DataPacket,
+  DataPacket_Kind,
+  DataStream_Chunk,
+  DataStream_Header,
+  DataStream_Trailer,
+  DisconnectReason,
+  JoinResponse,
+  LeaveRequest,
+  LeaveRequest_Action,
+  MetricsBatch,
+  ParticipantInfo,
+  ParticipantInfo_State,
+  ParticipantPermission,
+  Room as RoomModel,
+  ServerInfo,
+  SimulateScenario,
+  SipDTMF,
+  SpeakerInfo,
+  StreamStateUpdate,
+  SubscriptionError,
+  SubscriptionPermissionUpdate,
+  SubscriptionResponse,
+  TrackInfo,
+  TrackSource,
+  TrackType,
+  Transcription as TranscriptionModel,
+  TranscriptionSegment as TranscriptionSegmentModel,
+  UserPacket,
+  protoInt64,
+} from '@livekit/protocol';
 import { EventEmitter } from 'events';
 import type TypedEmitter from 'typed-emitter';
 import 'webrtc-adapter';
-import { toProtoSessionDescription } from '../api/SignalClient';
-import log from '../logger';
+import { EncryptionEvent } from '../e2ee';
+import { type BaseE2EEManager, E2EEManager } from '../e2ee/E2eeManager';
+import log, { LoggerNames, getLogger } from '../logger';
 import type {
   InternalRoomConnectOptions,
   InternalRoomOptions,
   RoomConnectOptions,
   RoomOptions,
 } from '../options';
-import {
-  DataPacket_Kind,
-  DisconnectReason,
-  ParticipantInfo,
-  ParticipantInfo_State,
-  ParticipantPermission,
-  Room as RoomModel,
-  ServerInfo,
-  SpeakerInfo,
-  SubscriptionError,
-  TrackInfo,
-  TrackSource,
-  TrackType,
-  UserPacket,
-} from '../proto/livekit_models';
-import {
-  ConnectionQualityUpdate,
-  JoinResponse,
-  SimulateScenario,
-  StreamStateUpdate,
-  SubscriptionPermissionUpdate,
-  SubscriptionResponse,
-} from '../proto/livekit_rtc';
+import { getBrowser } from '../utils/browserParser';
 import DeviceManager from './DeviceManager';
 import RTCEngine from './RTCEngine';
 import { RegionUrlProvider } from './RegionUrlProvider';
+import {
+  type ByteStreamHandler,
+  ByteStreamReader,
+  type TextStreamHandler,
+  TextStreamReader,
+} from './StreamReader';
 import {
   audioDefaults,
   publishDefaults,
@@ -48,26 +67,50 @@ import LocalParticipant from './participant/LocalParticipant';
 import type Participant from './participant/Participant';
 import type { ConnectionQuality } from './participant/Participant';
 import RemoteParticipant from './participant/RemoteParticipant';
+import { MAX_PAYLOAD_BYTES, RpcError, type RpcInvocationData, byteLength } from './rpc';
 import CriticalTimers from './timers';
 import LocalAudioTrack from './track/LocalAudioTrack';
+import type LocalTrack from './track/LocalTrack';
 import LocalTrackPublication from './track/LocalTrackPublication';
 import LocalVideoTrack from './track/LocalVideoTrack';
 import type RemoteTrack from './track/RemoteTrack';
 import RemoteTrackPublication from './track/RemoteTrackPublication';
 import { Track } from './track/Track';
 import type { TrackPublication } from './track/TrackPublication';
+import type { TrackProcessor } from './track/processor/types';
 import type { AdaptiveStreamSettings } from './track/types';
-import { getNewAudioContext } from './track/utils';
-import type { SimulationOptions, SimulationScenario } from './types';
+import { getNewAudioContext, sourceToKind } from './track/utils';
+import {
+  type ByteStreamInfo,
+  type ChatMessage,
+  type SimulationOptions,
+  type SimulationScenario,
+  type StreamController,
+  type TextStreamInfo,
+  type TranscriptionSegment,
+} from './types';
 import {
   Future,
-  Mutex,
+  bigIntToNumber,
   createDummyVideoStreamTrack,
+  extractChatMessage,
+  extractTranscriptionSegments,
+  getDisconnectReasonFromConnectionError,
   getEmptyAudioStreamTrack,
+  isBrowserSupported,
   isCloud,
+  isLocalAudioTrack,
+  isLocalParticipant,
+  isReactNative,
+  isRemotePub,
+  isSafari,
   isWeb,
+  numberToBigInt,
+  sleep,
   supportsSetSinkId,
+  toHttpUrl,
   unpackStreamId,
+  unwrapConstraint,
 } from './utils';
 
 export enum ConnectionState {
@@ -75,12 +118,10 @@ export enum ConnectionState {
   Connecting = 'connecting',
   Connected = 'connected',
   Reconnecting = 'reconnecting',
+  SignalReconnecting = 'signalReconnecting',
 }
 
-const connectionReconcileFrequency = 2 * 1000;
-
-/** @deprecated RoomState has been renamed to [[ConnectionState]] */
-export const RoomState = ConnectionState;
+const connectionReconcileFrequency = 4 * 1000;
 
 /**
  * In LiveKit, a room is the logical grouping for a list of participants.
@@ -93,8 +134,10 @@ export const RoomState = ConnectionState;
 class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) {
   state: ConnectionState = ConnectionState.Disconnected;
 
-  /** map of sid: [[RemoteParticipant]] */
-  participants: Map<string, RemoteParticipant>;
+  /**
+   * map of identity: [[RemoteParticipant]]
+   */
+  remoteParticipants: Map<string, RemoteParticipant>;
 
   /**
    * list of participants that are actively speaking. when this changes
@@ -111,9 +154,14 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   /** options of room */
   options: InternalRoomOptions;
 
+  /** reflects the sender encryption status of the local participant */
+  isE2EEEnabled: boolean = false;
+
+  serverInfo?: Partial<ServerInfo>;
+
   private roomInfo?: RoomModel;
 
-  private identityToSid: Map<string, string>;
+  private sidToIdentity: Map<string, string>;
 
   /** connect options of room */
   private connOptions?: InternalRoomConnectOptions;
@@ -130,9 +178,36 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
   private disconnectLock: Mutex;
 
-  private cachedParticipantSids: Array<string>;
+  private e2eeManager: BaseE2EEManager | undefined;
 
   private connectionReconcileInterval?: ReturnType<typeof setInterval>;
+
+  private regionUrlProvider?: RegionUrlProvider;
+
+  private regionUrl?: string;
+
+  private isVideoPlaybackBlocked: boolean = false;
+
+  private log = log;
+
+  private bufferedEvents: Array<any> = [];
+
+  private isResuming: boolean = false;
+
+  /**
+   * map to store first point in time when a particular transcription segment was received
+   */
+  private transcriptionReceivedTimes: Map<string, number>;
+
+  private byteStreamControllers = new Map<string, StreamController<DataStream_Chunk>>();
+
+  private textStreamControllers = new Map<string, StreamController<DataStream_Chunk>>();
+
+  private byteStreamHandlers = new Map<string, ByteStreamHandler>();
+
+  private textStreamHandlers = new Map<string, TextStreamHandler>();
+
+  private rpcHandlers: Map<string, (data: RpcInvocationData) => Promise<string>> = new Map();
 
   /**
    * Creates a new Room, the primary construct for a LiveKit session.
@@ -141,10 +216,12 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   constructor(options?: RoomOptions) {
     super();
     this.setMaxListeners(100);
-    this.participants = new Map();
-    this.cachedParticipantSids = [];
-    this.identityToSid = new Map();
+    this.remoteParticipants = new Map();
+    this.sidToIdentity = new Map();
     this.options = { ...roomOptionDefaults, ...options };
+
+    this.log = getLogger(this.options.loggerName ?? LoggerNames.Room);
+    this.transcriptionReceivedTimes = new Map();
 
     this.options.audioCaptureDefaults = {
       ...audioDefaults,
@@ -163,7 +240,226 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
     this.disconnectLock = new Mutex();
 
-    this.localParticipant = new LocalParticipant('', '', this.engine, this.options);
+    this.localParticipant = new LocalParticipant(
+      '',
+      '',
+      this.engine,
+      this.options,
+      this.rpcHandlers,
+    );
+
+    if (this.options.videoCaptureDefaults.deviceId) {
+      this.localParticipant.activeDeviceMap.set(
+        'videoinput',
+        unwrapConstraint(this.options.videoCaptureDefaults.deviceId),
+      );
+    }
+    if (this.options.audioCaptureDefaults.deviceId) {
+      this.localParticipant.activeDeviceMap.set(
+        'audioinput',
+        unwrapConstraint(this.options.audioCaptureDefaults.deviceId),
+      );
+    }
+    if (this.options.audioOutput?.deviceId) {
+      this.switchActiveDevice(
+        'audiooutput',
+        unwrapConstraint(this.options.audioOutput.deviceId),
+      ).catch((e) => this.log.warn(`Could not set audio output: ${e.message}`, this.logContext));
+    }
+
+    if (this.options.e2ee) {
+      this.setupE2EE();
+    }
+
+    if (isWeb()) {
+      const abortController = new AbortController();
+
+      // in order to catch device changes prior to room connection we need to register the event in the constructor
+      navigator.mediaDevices?.addEventListener('devicechange', this.handleDeviceChange, {
+        signal: abortController.signal,
+      });
+
+      if (Room.cleanupRegistry) {
+        Room.cleanupRegistry.register(this, () => {
+          abortController.abort();
+        });
+      }
+    }
+  }
+
+  registerTextStreamHandler(topic: string, callback: TextStreamHandler) {
+    if (this.textStreamHandlers.has(topic)) {
+      throw new TypeError(`A text stream handler for topic "${topic}" has already been set.`);
+    }
+    this.textStreamHandlers.set(topic, callback);
+  }
+
+  unregisterTextStreamHandler(topic: string) {
+    this.textStreamHandlers.delete(topic);
+  }
+
+  registerByteStreamHandler(topic: string, callback: ByteStreamHandler) {
+    if (this.byteStreamHandlers.has(topic)) {
+      throw new TypeError(`A byte stream handler for topic "${topic}" has already been set.`);
+    }
+    this.byteStreamHandlers.set(topic, callback);
+  }
+
+  unregisterByteStreamHandler(topic: string) {
+    this.byteStreamHandlers.delete(topic);
+  }
+
+  /**
+   * Establishes the participant as a receiver for calls of the specified RPC method.
+   * Will overwrite any existing callback for the same method.
+   *
+   * @param method - The name of the indicated RPC method
+   * @param handler - Will be invoked when an RPC request for this method is received
+   * @returns A promise that resolves when the method is successfully registered
+   * @throws {Error} if the handler for a specific method has already been registered already
+   *
+   * @example
+   * ```typescript
+   * room.localParticipant?.registerRpcMethod(
+   *   'greet',
+   *   async (data: RpcInvocationData) => {
+   *     console.log(`Received greeting from ${data.callerIdentity}: ${data.payload}`);
+   *     return `Hello, ${data.callerIdentity}!`;
+   *   }
+   * );
+   * ```
+   *
+   * The handler should return a Promise that resolves to a string.
+   * If unable to respond within `responseTimeout`, the request will result in an error on the caller's side.
+   *
+   * You may throw errors of type `RpcError` with a string `message` in the handler,
+   * and they will be received on the caller's side with the message intact.
+   * Other errors thrown in your handler will not be transmitted as-is, and will instead arrive to the caller as `1500` ("Application Error").
+   */
+  registerRpcMethod(method: string, handler: (data: RpcInvocationData) => Promise<string>) {
+    if (this.rpcHandlers.has(method)) {
+      throw Error(
+        `RPC handler already registered for method ${method}, unregisterRpcMethod before trying to register again`,
+      );
+    }
+    this.rpcHandlers.set(method, handler);
+  }
+
+  /**
+   * Unregisters a previously registered RPC method.
+   *
+   * @param method - The name of the RPC method to unregister
+   */
+  unregisterRpcMethod(method: string) {
+    this.rpcHandlers.delete(method);
+  }
+
+  private async handleIncomingRpcRequest(
+    callerIdentity: string,
+    requestId: string,
+    method: string,
+    payload: string,
+    responseTimeout: number,
+    version: number,
+  ) {
+    await this.engine.publishRpcAck(callerIdentity, requestId);
+
+    if (version !== 1) {
+      await this.engine.publishRpcResponse(
+        callerIdentity,
+        requestId,
+        null,
+        RpcError.builtIn('UNSUPPORTED_VERSION'),
+      );
+      return;
+    }
+
+    const handler = this.rpcHandlers.get(method);
+
+    if (!handler) {
+      await this.engine.publishRpcResponse(
+        callerIdentity,
+        requestId,
+        null,
+        RpcError.builtIn('UNSUPPORTED_METHOD'),
+      );
+      return;
+    }
+
+    let responseError: RpcError | null = null;
+    let responsePayload: string | null = null;
+
+    try {
+      const response = await handler({
+        requestId,
+        callerIdentity,
+        payload,
+        responseTimeout,
+      });
+      if (byteLength(response) > MAX_PAYLOAD_BYTES) {
+        responseError = RpcError.builtIn('RESPONSE_PAYLOAD_TOO_LARGE');
+        console.warn(`RPC Response payload too large for ${method}`);
+      } else {
+        responsePayload = response;
+      }
+    } catch (error) {
+      if (error instanceof RpcError) {
+        responseError = error;
+      } else {
+        console.warn(
+          `Uncaught error returned by RPC handler for ${method}. Returning APPLICATION_ERROR instead.`,
+          error,
+        );
+        responseError = RpcError.builtIn('APPLICATION_ERROR');
+      }
+    }
+    await this.engine.publishRpcResponse(callerIdentity, requestId, responsePayload, responseError);
+  }
+
+  /**
+   * @experimental
+   */
+  async setE2EEEnabled(enabled: boolean) {
+    if (this.e2eeManager) {
+      await Promise.all([this.localParticipant.setE2EEEnabled(enabled)]);
+      if (this.localParticipant.identity !== '') {
+        this.e2eeManager.setParticipantCryptorEnabled(enabled, this.localParticipant.identity);
+      }
+    } else {
+      throw Error('e2ee not configured, please set e2ee settings within the room options');
+    }
+  }
+
+  private setupE2EE() {
+    if (this.options.e2ee) {
+      if ('e2eeManager' in this.options.e2ee) {
+        this.e2eeManager = this.options.e2ee.e2eeManager;
+      } else {
+        this.e2eeManager = new E2EEManager(this.options.e2ee);
+      }
+      this.e2eeManager.on(
+        EncryptionEvent.ParticipantEncryptionStatusChanged,
+        (enabled, participant) => {
+          if (isLocalParticipant(participant)) {
+            this.isE2EEEnabled = enabled;
+          }
+          this.emit(RoomEvent.ParticipantEncryptionStatusChanged, enabled, participant);
+        },
+      );
+      this.e2eeManager.on(EncryptionEvent.EncryptionError, (error) =>
+        this.emit(RoomEvent.EncryptionError, error),
+      );
+      this.e2eeManager?.setup(this);
+    }
+  }
+
+  private get logContext() {
+    return {
+      room: this.name,
+      roomID: this.roomInfo?.sid,
+      participant: this.localParticipant.identity,
+      pID: this.localParticipant.sid,
+    };
   }
 
   /**
@@ -173,9 +469,30 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     return this.roomInfo?.activeRecording ?? false;
   }
 
-  /** server assigned unique room id */
-  get sid(): string {
-    return this.roomInfo?.sid ?? '';
+  /**
+   * server assigned unique room id.
+   * returns once a sid has been issued by the server.
+   */
+  async getSid(): Promise<string> {
+    if (this.state === ConnectionState.Disconnected) {
+      return '';
+    }
+    if (this.roomInfo && this.roomInfo.sid !== '') {
+      return this.roomInfo.sid;
+    }
+    return new Promise((resolve, reject) => {
+      const handleRoomUpdate = (roomInfo: RoomModel) => {
+        if (roomInfo.sid !== '') {
+          this.engine.off(EngineEvent.RoomUpdate, handleRoomUpdate);
+          resolve(roomInfo.sid);
+        }
+      };
+      this.engine.on(EngineEvent.RoomUpdate, handleRoomUpdate);
+      this.once(RoomEvent.Disconnected, () => {
+        this.engine.off(EngineEvent.RoomUpdate, handleRoomUpdate);
+        reject('Room disconnected before room server id was available');
+      });
+    });
   }
 
   /** user assigned name, derived from JWT token */
@@ -203,18 +520,17 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
     this.engine = new RTCEngine(this.options);
 
-    this.engine.client.onParticipantUpdate = this.handleParticipantUpdates;
-    this.engine.client.onRoomUpdate = this.handleRoomUpdate;
-    this.engine.client.onSpeakersChanged = this.handleSpeakersChanged;
-    this.engine.client.onStreamStateUpdate = this.handleStreamStateUpdate;
-    this.engine.client.onSubscriptionPermissionUpdate = this.handleSubscriptionPermissionUpdate;
-    this.engine.client.onConnectionQuality = this.handleConnectionQualityUpdate;
-    this.engine.client.onSubscriptionError = this.handleSubscriptionError;
-
     this.engine
+      .on(EngineEvent.ParticipantUpdate, this.handleParticipantUpdates)
+      .on(EngineEvent.RoomUpdate, this.handleRoomUpdate)
+      .on(EngineEvent.SpeakersChanged, this.handleSpeakersChanged)
+      .on(EngineEvent.StreamStateChanged, this.handleStreamStateUpdate)
+      .on(EngineEvent.ConnectionQualityUpdate, this.handleConnectionQualityUpdate)
+      .on(EngineEvent.SubscriptionError, this.handleSubscriptionError)
+      .on(EngineEvent.SubscriptionPermissionUpdate, this.handleSubscriptionPermissionUpdate)
       .on(
         EngineEvent.MediaTrackAdded,
-        (mediaTrack: MediaStreamTrack, stream: MediaStream, receiver?: RTCRtpReceiver) => {
+        (mediaTrack: MediaStreamTrack, stream: MediaStream, receiver: RTCRtpReceiver) => {
           this.onTrackAdded(mediaTrack, stream, receiver);
         },
       )
@@ -225,45 +541,69 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       .on(EngineEvent.DataPacketReceived, this.handleDataPacket)
       .on(EngineEvent.Resuming, () => {
         this.clearConnectionReconcile();
-        if (this.setAndEmitConnectionState(ConnectionState.Reconnecting)) {
-          this.emit(RoomEvent.Reconnecting);
+        this.isResuming = true;
+        this.log.info('Resuming signal connection', this.logContext);
+        if (this.setAndEmitConnectionState(ConnectionState.SignalReconnecting)) {
+          this.emit(RoomEvent.SignalReconnecting);
         }
-        this.cachedParticipantSids = Array.from(this.participants.keys());
       })
       .on(EngineEvent.Resumed, () => {
-        this.setAndEmitConnectionState(ConnectionState.Connected);
-        this.emit(RoomEvent.Reconnected);
         this.registerConnectionReconcile();
+        this.isResuming = false;
+        this.log.info('Resumed signal connection', this.logContext);
         this.updateSubscriptions();
-
-        // once reconnected, figure out if any participants connected during reconnect and emit events for it
-        const diffParticipants = Array.from(this.participants.values()).filter(
-          (p) => !this.cachedParticipantSids.includes(p.sid),
-        );
-        diffParticipants.forEach((p) => this.emit(RoomEvent.ParticipantConnected, p));
-        this.cachedParticipantSids = [];
+        this.emitBufferedEvents();
+        if (this.setAndEmitConnectionState(ConnectionState.Connected)) {
+          this.emit(RoomEvent.Reconnected);
+        }
       })
       .on(EngineEvent.SignalResumed, () => {
-        if (this.state === ConnectionState.Reconnecting) {
+        this.bufferedEvents = [];
+        if (this.state === ConnectionState.Reconnecting || this.isResuming) {
           this.sendSyncState();
         }
       })
       .on(EngineEvent.Restarting, this.handleRestarting)
       .on(EngineEvent.SignalRestarted, this.handleSignalRestarted)
+      .on(EngineEvent.Offline, () => {
+        if (this.setAndEmitConnectionState(ConnectionState.Reconnecting)) {
+          this.emit(RoomEvent.Reconnecting);
+        }
+      })
       .on(EngineEvent.DCBufferStatusChanged, (status, kind) => {
         this.emit(RoomEvent.DCBufferStatusChanged, status, kind);
+      })
+      .on(EngineEvent.LocalTrackSubscribed, (subscribedSid) => {
+        const trackPublication = this.localParticipant
+          .getTrackPublications()
+          .find(({ trackSid }) => trackSid === subscribedSid) as LocalTrackPublication | undefined;
+        if (!trackPublication) {
+          this.log.warn(
+            'could not find local track subscription for subscribed event',
+            this.logContext,
+          );
+          return;
+        }
+        this.localParticipant.emit(ParticipantEvent.LocalTrackSubscribed, trackPublication);
+        this.emitWhenConnected(
+          RoomEvent.LocalTrackSubscribed,
+          trackPublication,
+          this.localParticipant,
+        );
       });
 
     if (this.localParticipant) {
       this.localParticipant.setupEngine(this.engine);
     }
+    if (this.e2eeManager) {
+      this.e2eeManager.setupEngine(this.engine);
+    }
   }
 
   /**
    * getLocalDevices abstracts navigator.mediaDevices.enumerateDevices.
-   * In particular, it handles Chrome's unique behavior of creating `default`
-   * devices. When encountered, it'll be removed from the list of devices.
-   * The actual default device will be placed at top.
+   * In particular, it requests device permissions by default if needed
+   * and makes sure the returned device does not consist of dummy devices
    * @param kind
    * @returns a list of available local devices
    */
@@ -274,25 +614,62 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     return DeviceManager.getInstance().getDevices(kind, requestPermissions);
   }
 
+  static cleanupRegistry =
+    typeof FinalizationRegistry !== 'undefined' &&
+    new FinalizationRegistry((cleanup: () => void) => {
+      cleanup();
+    });
+
   /**
-   * prepares the connection to the livekit server by sending a HEAD request in order to
-   * 1. speed up DNS resolution
-   * 2. speed up TLS setup
-   * on the actual connection request
-   * throws an error if server is not reachable after the request timeout
-   * @experimental
+   * prepareConnection should be called as soon as the page is loaded, in order
+   * to speed up the connection attempt. This function will
+   * - perform DNS resolution and pre-warm the DNS cache
+   * - establish TLS connection and cache TLS keys
+   *
+   * With LiveKit Cloud, it will also determine the best edge data center for
+   * the current client to connect to if a token is provided.
    */
-  async prepareConnection(url: string) {
-    await fetch(`http${url.substring(2)}`, { method: 'HEAD' });
+  async prepareConnection(url: string, token?: string) {
+    if (this.state !== ConnectionState.Disconnected) {
+      return;
+    }
+    this.log.debug(`prepareConnection to ${url}`, this.logContext);
+    try {
+      if (isCloud(new URL(url)) && token) {
+        this.regionUrlProvider = new RegionUrlProvider(url, token);
+        const regionUrl = await this.regionUrlProvider.getNextBestRegionUrl();
+        // we will not replace the regionUrl if an attempt had already started
+        // to avoid overriding regionUrl after a new connection attempt had started
+        if (regionUrl && this.state === ConnectionState.Disconnected) {
+          this.regionUrl = regionUrl;
+          await fetch(toHttpUrl(regionUrl), { method: 'HEAD' });
+          this.log.debug(`prepared connection to ${regionUrl}`, this.logContext);
+        }
+      } else {
+        await fetch(toHttpUrl(url), { method: 'HEAD' });
+      }
+    } catch (e) {
+      this.log.warn('could not prepare connection', { ...this.logContext, error: e });
+    }
   }
 
   connect = async (url: string, token: string, opts?: RoomConnectOptions): Promise<void> => {
+    if (!isBrowserSupported()) {
+      if (isReactNative()) {
+        throw Error("WebRTC isn't detected, have you called registerGlobals?");
+      } else {
+        throw Error(
+          "LiveKit doesn't seem to be supported on this browser. Try to update your browser and make sure no browser extensions are disabling webRTC.",
+        );
+      }
+    }
+
     // In case a disconnect called happened right before the connect call, make sure the disconnect is completed first by awaiting its lock
     const unlockDisconnect = await this.disconnectLock.lock();
 
     if (this.state === ConnectionState.Connected) {
       // when the state is reconnecting or connected, this function returns immediately
-      log.info(`already connected to room ${this.name}`);
+      this.log.info(`already connected to room ${this.name}`, this.logContext);
       unlockDisconnect();
       return Promise.resolve();
     }
@@ -303,8 +680,28 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     }
 
     this.setAndEmitConnectionState(ConnectionState.Connecting);
-
-    const urlProvider = new RegionUrlProvider(url, token);
+    if (this.regionUrlProvider?.getServerUrl().toString() !== url) {
+      this.regionUrl = undefined;
+      this.regionUrlProvider = undefined;
+    }
+    if (isCloud(new URL(url))) {
+      if (this.regionUrlProvider === undefined) {
+        this.regionUrlProvider = new RegionUrlProvider(url, token);
+      } else {
+        this.regionUrlProvider.updateToken(token);
+      }
+      // trigger the first fetch without waiting for a response
+      // if initial connection fails, this will speed up picking regional url
+      // on subsequent runs
+      this.regionUrlProvider
+        .fetchRegionSettings()
+        .then((settings) => {
+          this.regionUrlProvider?.setServerReportedRegions(settings);
+        })
+        .catch((e) => {
+          this.log.warn('could not fetch region settings', { ...this.logContext, error: e });
+        });
+    }
 
     const connectFn = async (
       resolve: () => void,
@@ -314,47 +711,75 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       if (this.abortController) {
         this.abortController.abort();
       }
-      this.abortController = new AbortController();
+
+      // explicit creation as local var needed to satisfy TS compiler when passing it to `attemptConnection` further down
+      const abortController = new AbortController();
+      this.abortController = abortController;
 
       // at this point the intention to connect has been signalled so we can allow cancelling of the connection via disconnect() again
       unlockDisconnect?.();
 
       try {
-        await this.attemptConnection(regionUrl ?? url, token, opts, this.abortController);
+        await this.attemptConnection(regionUrl ?? url, token, opts, abortController);
         this.abortController = undefined;
         resolve();
       } catch (e) {
         if (
-          isCloud(new URL(url)) &&
+          this.regionUrlProvider &&
           e instanceof ConnectionError &&
-          e.reason !== ConnectionErrorReason.Cancelled
+          e.reason !== ConnectionErrorReason.Cancelled &&
+          e.reason !== ConnectionErrorReason.NotAllowed
         ) {
           let nextUrl: string | null = null;
           try {
-            nextUrl = await urlProvider.getNextBestRegionUrl(this.abortController?.signal);
+            nextUrl = await this.regionUrlProvider.getNextBestRegionUrl(
+              this.abortController?.signal,
+            );
           } catch (error) {
             if (
               error instanceof ConnectionError &&
               (error.status === 401 || error.reason === ConnectionErrorReason.Cancelled)
             ) {
+              this.handleDisconnect(this.options.stopLocalTrackOnUnpublish);
               reject(error);
               return;
             }
           }
-          if (nextUrl) {
-            log.debug('initial connection failed, retrying with another region');
+          if (nextUrl && !this.abortController?.signal.aborted) {
+            this.log.info(
+              `Initial connection failed with ConnectionError: ${e.message}. Retrying with another region: ${nextUrl}`,
+              this.logContext,
+            );
+            this.recreateEngine();
             await connectFn(resolve, reject, nextUrl);
           } else {
+            this.handleDisconnect(
+              this.options.stopLocalTrackOnUnpublish,
+              getDisconnectReasonFromConnectionError(e),
+            );
             reject(e);
           }
         } else {
+          let disconnectReason = DisconnectReason.UNKNOWN_REASON;
+          if (e instanceof ConnectionError) {
+            disconnectReason = getDisconnectReasonFromConnectionError(e);
+          }
+          this.handleDisconnect(this.options.stopLocalTrackOnUnpublish, disconnectReason);
           reject(e);
         }
       }
     };
-    this.connectFuture = new Future(connectFn, () => {
-      this.clearConnectionFutures();
-    });
+
+    const regionUrl = this.regionUrl;
+    this.regionUrl = undefined;
+    this.connectFuture = new Future(
+      (resolve, reject) => {
+        connectFn(resolve, reject, regionUrl);
+      },
+      () => {
+        this.clearConnectionFutures();
+      },
+    );
 
     return this.connectFuture.promise;
   };
@@ -372,10 +797,11 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       token,
       {
         autoSubscribe: connectOptions.autoSubscribe,
-        publishOnly: connectOptions.publishOnly,
         adaptiveStream:
           typeof roomOptions.adaptiveStream === 'object' ? true : roomOptions.adaptiveStream,
         maxRetries: connectOptions.maxRetries,
+        e2eeEnabled: !!this.e2eeManager,
+        websocketTimeout: connectOptions.websocketTimeout,
       },
       abortController.signal,
     );
@@ -384,19 +810,25 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     if (!serverInfo) {
       serverInfo = { version: joinResponse.serverVersion, region: joinResponse.serverRegion };
     }
+    this.serverInfo = serverInfo;
 
-    log.debug(
+    this.log.debug(
       `connected to Livekit Server ${Object.entries(serverInfo)
         .map(([key, value]) => `${key}: ${value}`)
         .join(', ')}`,
+      {
+        room: joinResponse.room?.name,
+        roomSid: joinResponse.room?.sid,
+        identity: joinResponse.participant?.identity,
+      },
     );
 
-    if (!joinResponse.serverVersion) {
+    if (!serverInfo.version) {
       throw new UnsupportedServer('unknown server version');
     }
 
-    if (joinResponse.serverVersion === '0.15.1' && this.options.dynacast) {
-      log.debug('disabling dynacast due to server version');
+    if (serverInfo.version === '0.15.1' && this.options.dynacast) {
+      this.log.debug('disabling dynacast due to server version', this.logContext);
       // dynacast has a bug in 0.15.1, so we cannot use it then
       roomOptions.dynacast = false;
     }
@@ -409,6 +841,18 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
     this.localParticipant.sid = pi.sid;
     this.localParticipant.identity = pi.identity;
+    this.localParticipant.setEnabledPublishCodecs(joinResponse.enabledPublishCodecs);
+
+    if (this.options.e2ee && this.e2eeManager) {
+      try {
+        this.e2eeManager.setSifTrailer(joinResponse.sifTrailer);
+      } catch (e: any) {
+        this.log.error(e instanceof Error ? e.message : 'Could not set SifTrailer', {
+          ...this.logContext,
+          error: e,
+        });
+      }
+    }
 
     // populate remote participants, these should not trigger new events
     this.handleParticipantUpdates([pi, ...joinResponse.otherParticipants]);
@@ -424,13 +868,20 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     opts: RoomConnectOptions | undefined,
     abortController: AbortController,
   ) => {
-    if (this.state === ConnectionState.Reconnecting) {
-      log.info('Reconnection attempt replaced by new connection attempt');
+    if (
+      this.state === ConnectionState.Reconnecting ||
+      this.isResuming ||
+      this.engine?.pendingReconnect
+    ) {
+      this.log.info('Reconnection attempt replaced by new connection attempt', this.logContext);
       // make sure we close and recreate the existing engine in order to get rid of any potentially ongoing reconnection attempts
       this.recreateEngine();
     } else {
       // create engine if previously disconnected
       this.maybeCreateEngine();
+    }
+    if (this.regionUrlProvider?.isCloud()) {
+      this.engine.setRegionUrlProvider(this.regionUrlProvider);
     }
 
     this.acquireAudioContext();
@@ -459,9 +910,12 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       this.setupLocalParticipantEvents();
       this.emit(RoomEvent.SignalConnected);
     } catch (err) {
+      await this.engine.close();
       this.recreateEngine();
-      this.handleDisconnect(this.options.stopLocalTrackOnUnpublish);
-      const resultingError = new ConnectionError(`could not establish signal connection`);
+      const resultingError = new ConnectionError(
+        `could not establish signal connection`,
+        ConnectionErrorReason.ServerUnreachable,
+      );
       if (err instanceof Error) {
         resultingError.message = `${resultingError.message}: ${err.message}`;
       }
@@ -469,14 +923,17 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         resultingError.reason = err.reason;
         resultingError.status = err.status;
       }
-      log.debug(`error trying to establish signal connection`, { error: err });
+      this.log.debug(`error trying to establish signal connection`, {
+        ...this.logContext,
+        error: err,
+      });
       throw resultingError;
     }
 
     if (abortController.signal.aborted) {
+      await this.engine.close();
       this.recreateEngine();
-      this.handleDisconnect(this.options.stopLocalTrackOnUnpublish);
-      throw new ConnectionError(`Connection attempt aborted`);
+      throw new ConnectionError(`Connection attempt aborted`, ConnectionErrorReason.Cancelled);
     }
 
     try {
@@ -485,8 +942,8 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         abortController,
       );
     } catch (e) {
+      await this.engine.close();
       this.recreateEngine();
-      this.handleDisconnect(this.options.stopLocalTrackOnUnpublish);
       throw e;
     }
 
@@ -495,7 +952,9 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       // capturing both 'pagehide' and 'beforeunload' to capture broadest set of browser behaviors
       window.addEventListener('pagehide', this.onPageLeave);
       window.addEventListener('beforeunload', this.onPageLeave);
-      navigator.mediaDevices?.addEventListener('devicechange', this.handleDeviceChange);
+    }
+    if (isWeb()) {
+      document.addEventListener('freeze', this.onPageLeave);
     }
     this.setAndEmitConnectionState(ConnectionState.Connected);
     this.emit(RoomEvent.Connected);
@@ -509,23 +968,28 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     const unlock = await this.disconnectLock.lock();
     try {
       if (this.state === ConnectionState.Disconnected) {
-        log.debug('already disconnected');
+        this.log.debug('already disconnected', this.logContext);
         return;
       }
-      log.info('disconnect from room', { identity: this.localParticipant.identity });
+      this.log.info('disconnect from room', {
+        ...this.logContext,
+      });
       if (
         this.state === ConnectionState.Connecting ||
-        this.state === ConnectionState.Reconnecting
+        this.state === ConnectionState.Reconnecting ||
+        this.isResuming
       ) {
         // try aborting pending connection attempt
-        log.warn('abort connection attempt');
+        this.log.warn('abort connection attempt', this.logContext);
         this.abortController?.abort();
         // in case the abort controller didn't manage to cancel the connection attempt, reject the connect promise explicitly
-        this.connectFuture?.reject?.(new ConnectionError('Client initiated disconnect'));
+        this.connectFuture?.reject?.(
+          new ConnectionError('Client initiated disconnect', ConnectionErrorReason.Cancelled),
+        );
         this.connectFuture = undefined;
       }
       // send leave
-      if (this.engine?.client.isConnected) {
+      if (!this.engine?.client.isDisconnected) {
         await this.engine.client.sendLeave();
       }
       // close engine (also closes client)
@@ -549,10 +1013,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     if (this.localParticipant.identity === identity) {
       return this.localParticipant;
     }
-    const sid = this.identityToSid.get(identity);
-    if (sid) {
-      return this.participants.get(sid);
-    }
+    return this.remoteParticipants.get(identity);
   }
 
   private clearConnectionFutures() {
@@ -562,89 +1023,128 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   /**
    * @internal for testing
    */
-  async simulateScenario(scenario: SimulationScenario) {
+  async simulateScenario(scenario: SimulationScenario, arg?: any) {
     let postAction = () => {};
     let req: SimulateScenario | undefined;
     switch (scenario) {
       case 'signal-reconnect':
-        await this.engine.client.close();
-        if (this.engine.client.onClose) {
-          this.engine.client.onClose('simulate disconnect');
-        }
+        // @ts-expect-error function is private
+        await this.engine.client.handleOnClose('simulate disconnect');
         break;
       case 'speaker':
-        req = SimulateScenario.fromPartial({
+        req = new SimulateScenario({
           scenario: {
-            $case: 'speakerUpdate',
-            speakerUpdate: 3,
+            case: 'speakerUpdate',
+            value: 3,
           },
         });
         break;
       case 'node-failure':
-        req = SimulateScenario.fromPartial({
+        req = new SimulateScenario({
           scenario: {
-            $case: 'nodeFailure',
-            nodeFailure: true,
+            case: 'nodeFailure',
+            value: true,
           },
         });
         break;
       case 'server-leave':
-        req = SimulateScenario.fromPartial({
+        req = new SimulateScenario({
           scenario: {
-            $case: 'serverLeave',
-            serverLeave: true,
+            case: 'serverLeave',
+            value: true,
           },
         });
         break;
       case 'migration':
-        req = SimulateScenario.fromPartial({
+        req = new SimulateScenario({
           scenario: {
-            $case: 'migration',
-            migration: true,
+            case: 'migration',
+            value: true,
           },
         });
         break;
       case 'resume-reconnect':
         this.engine.failNext();
-        await this.engine.client.close();
-        if (this.engine.client.onClose) {
-          this.engine.client.onClose('simulate resume-reconnect');
-        }
+        // @ts-expect-error function is private
+        await this.engine.client.handleOnClose('simulate resume-disconnect');
+        break;
+      case 'disconnect-signal-on-resume':
+        postAction = async () => {
+          // @ts-expect-error function is private
+          await this.engine.client.handleOnClose('simulate resume-disconnect');
+        };
+        req = new SimulateScenario({
+          scenario: {
+            case: 'disconnectSignalOnResume',
+            value: true,
+          },
+        });
+        break;
+      case 'disconnect-signal-on-resume-no-messages':
+        postAction = async () => {
+          // @ts-expect-error function is private
+          await this.engine.client.handleOnClose('simulate resume-disconnect');
+        };
+        req = new SimulateScenario({
+          scenario: {
+            case: 'disconnectSignalOnResumeNoMessages',
+            value: true,
+          },
+        });
         break;
       case 'full-reconnect':
         this.engine.fullReconnectOnNext = true;
-        await this.engine.client.close();
-        if (this.engine.client.onClose) {
-          this.engine.client.onClose('simulate full-reconnect');
-        }
+        // @ts-expect-error function is private
+        await this.engine.client.handleOnClose('simulate full-reconnect');
         break;
       case 'force-tcp':
       case 'force-tls':
-        req = SimulateScenario.fromPartial({
+        req = new SimulateScenario({
           scenario: {
-            $case: 'switchCandidateProtocol',
-            switchCandidateProtocol: scenario === 'force-tls' ? 2 : 1,
+            case: 'switchCandidateProtocol',
+            value: scenario === 'force-tls' ? 2 : 1,
           },
         });
         postAction = async () => {
           const onLeave = this.engine.client.onLeave;
           if (onLeave) {
-            onLeave({
-              reason: DisconnectReason.CLIENT_INITIATED,
-              canReconnect: true,
-            });
+            onLeave(
+              new LeaveRequest({
+                reason: DisconnectReason.CLIENT_INITIATED,
+                action: LeaveRequest_Action.RECONNECT,
+              }),
+            );
           }
         };
         break;
+      case 'subscriber-bandwidth':
+        if (arg === undefined || typeof arg !== 'number') {
+          throw new Error('subscriber-bandwidth requires a number as argument');
+        }
+        req = new SimulateScenario({
+          scenario: {
+            case: 'subscriberBandwidth',
+            value: numberToBigInt(arg),
+          },
+        });
+        break;
+      case 'leave-full-reconnect':
+        req = new SimulateScenario({
+          scenario: {
+            case: 'leaveRequestFullReconnect',
+            value: true,
+          },
+        });
       default:
     }
     if (req) {
-      this.engine.client.sendSimulateScenario(req);
-      postAction();
+      await this.engine.client.sendSimulateScenario(req);
+      await postAction();
     }
   }
 
   private onPageLeave = async () => {
+    this.log.info('Page leave detected, disconnecting', this.logContext);
     await this.disconnect();
   };
 
@@ -655,12 +1155,54 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
    * - `startAudio`
    * - `getUserMedia`
    */
-  async startAudio() {
-    await this.acquireAudioContext();
-
+  startAudio = async () => {
     const elements: Array<HTMLMediaElement> = [];
-    this.participants.forEach((p) => {
-      p.audioTracks.forEach((t) => {
+    const browser = getBrowser();
+    if (browser && browser.os === 'iOS') {
+      /**
+       * iOS blocks audio element playback if
+       * - user is not publishing audio themselves and
+       * - no other audio source is playing
+       *
+       * as a workaround, we create an audio element with an empty track, so that
+       * silent audio is always playing
+       */
+      const audioId = 'livekit-dummy-audio-el';
+      let dummyAudioEl = document.getElementById(audioId) as HTMLAudioElement | null;
+      if (!dummyAudioEl) {
+        dummyAudioEl = document.createElement('audio');
+        dummyAudioEl.id = audioId;
+        dummyAudioEl.autoplay = true;
+        dummyAudioEl.hidden = true;
+        const track = getEmptyAudioStreamTrack();
+        track.enabled = true;
+        const stream = new MediaStream([track]);
+        dummyAudioEl.srcObject = stream;
+        document.addEventListener('visibilitychange', () => {
+          if (!dummyAudioEl) {
+            return;
+          }
+          // set the srcObject to null on page hide in order to prevent lock screen controls to show up for it
+          dummyAudioEl.srcObject = document.hidden ? null : stream;
+          if (!document.hidden) {
+            this.log.debug(
+              'page visible again, triggering startAudio to resume playback and update playback status',
+              this.logContext,
+            );
+            this.startAudio();
+          }
+        });
+        document.body.append(dummyAudioEl);
+        this.once(RoomEvent.Disconnected, () => {
+          dummyAudioEl?.remove();
+          dummyAudioEl = null;
+        });
+      }
+      elements.push(dummyAudioEl);
+    }
+
+    this.remoteParticipants.forEach((p) => {
+      p.audioTrackPublications.forEach((t) => {
         if (t.track) {
           t.track.attachedElements.forEach((e) => {
             elements.push(e);
@@ -670,18 +1212,46 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     });
 
     try {
-      await Promise.all(
-        elements.map((e) => {
+      await Promise.all([
+        this.acquireAudioContext(),
+        ...elements.map((e) => {
           e.muted = false;
           return e.play();
         }),
-      );
+      ]);
       this.handleAudioPlaybackStarted();
     } catch (err) {
       this.handleAudioPlaybackFailed(err);
       throw err;
     }
-  }
+  };
+
+  startVideo = async () => {
+    const elements: HTMLMediaElement[] = [];
+    for (const p of this.remoteParticipants.values()) {
+      p.videoTrackPublications.forEach((tr) => {
+        tr.track?.attachedElements.forEach((el) => {
+          if (!elements.includes(el)) {
+            elements.push(el);
+          }
+        });
+      });
+    }
+    await Promise.all(elements.map((el) => el.play()))
+      .then(() => {
+        this.handleVideoPlaybackStarted();
+      })
+      .catch((e) => {
+        if (e.name === 'NotAllowedError') {
+          this.handleVideoPlaybackFailed();
+        } else {
+          this.log.warn(
+            'Resuming video playback failed, make sure you call `startVideo` directly in a user gesture handler',
+            this.logContext,
+          );
+        }
+      });
+  };
 
   /**
    * Returns true if audio playback is enabled
@@ -691,14 +1261,14 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   }
 
   /**
-   * Returns the active audio output device used in this room.
-   *
-   * Note: to get the active `audioinput` or `videoinput` use [[LocalTrack.getDeviceId()]]
-   *
-   * @return the previously successfully set audio output device ID or an empty string if the default device is used.
+   * Returns true if video playback is enabled
    */
-  getActiveAudioOutputDevice(): string {
-    return this.options.audioOutput?.deviceId ?? '';
+  get canPlaybackVideo(): boolean {
+    return !this.isVideoPlaybackBlocked;
+  }
+
+  getActiveDevice(kind: MediaDeviceKind): string | undefined {
+    return this.localParticipant.activeDeviceMap.get(kind);
   }
 
   /**
@@ -712,60 +1282,97 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
    * @param deviceId
    */
   async switchActiveDevice(kind: MediaDeviceKind, deviceId: string, exact: boolean = false) {
+    let success = true;
+    let needsUpdateWithoutTracks = false;
     const deviceConstraint = exact ? { exact: deviceId } : deviceId;
     if (kind === 'audioinput') {
-      const prevDeviceId = this.options.audioCaptureDefaults!.deviceId;
+      needsUpdateWithoutTracks = this.localParticipant.audioTrackPublications.size === 0;
+      const prevDeviceId =
+        this.getActiveDevice(kind) ?? this.options.audioCaptureDefaults!.deviceId;
       this.options.audioCaptureDefaults!.deviceId = deviceConstraint;
-      const tracks = Array.from(this.localParticipant.audioTracks.values()).filter(
+      const tracks = Array.from(this.localParticipant.audioTrackPublications.values()).filter(
         (track) => track.source === Track.Source.Microphone,
       );
       try {
-        await Promise.all(tracks.map((t) => t.audioTrack?.setDeviceId(deviceConstraint)));
+        success = (
+          await Promise.all(tracks.map((t) => t.audioTrack?.setDeviceId(deviceConstraint)))
+        ).every((val) => val === true);
       } catch (e) {
         this.options.audioCaptureDefaults!.deviceId = prevDeviceId;
         throw e;
       }
     } else if (kind === 'videoinput') {
-      const prevDeviceId = this.options.videoCaptureDefaults!.deviceId;
+      needsUpdateWithoutTracks = this.localParticipant.videoTrackPublications.size === 0;
+      const prevDeviceId =
+        this.getActiveDevice(kind) ?? this.options.videoCaptureDefaults!.deviceId;
       this.options.videoCaptureDefaults!.deviceId = deviceConstraint;
-      const tracks = Array.from(this.localParticipant.videoTracks.values()).filter(
+      const tracks = Array.from(this.localParticipant.videoTrackPublications.values()).filter(
         (track) => track.source === Track.Source.Camera,
       );
       try {
-        await Promise.all(tracks.map((t) => t.videoTrack?.setDeviceId(deviceConstraint)));
+        success = (
+          await Promise.all(tracks.map((t) => t.videoTrack?.setDeviceId(deviceConstraint)))
+        ).every((val) => val === true);
       } catch (e) {
         this.options.videoCaptureDefaults!.deviceId = prevDeviceId;
         throw e;
       }
     } else if (kind === 'audiooutput') {
-      // TODO add support for webaudio mix once the API becomes available https://github.com/WebAudio/web-audio-api/pull/2498
-      if (!supportsSetSinkId()) {
+      if (
+        (!supportsSetSinkId() && !this.options.webAudioMix) ||
+        (this.options.webAudioMix && this.audioContext && !('setSinkId' in this.audioContext))
+      ) {
         throw new Error('cannot switch audio output, setSinkId not supported');
       }
+      if (this.options.webAudioMix) {
+        // setting `default` for web audio output doesn't work, so we need to normalize the id before
+        deviceId =
+          (await DeviceManager.getInstance().normalizeDeviceId('audiooutput', deviceId)) ?? '';
+      }
       this.options.audioOutput ??= {};
-      const prevDeviceId = this.options.audioOutput.deviceId;
+      const prevDeviceId = this.getActiveDevice(kind) ?? this.options.audioOutput.deviceId;
       this.options.audioOutput.deviceId = deviceId;
+
       try {
+        if (this.options.webAudioMix) {
+          // @ts-expect-error setSinkId is not yet in the typescript type of AudioContext
+          this.audioContext?.setSinkId(deviceId);
+        }
+        // also set audio output on all audio elements, even if webAudioMix is enabled in order to workaround echo cancellation not working on chrome with non-default output devices
+        // see https://issues.chromium.org/issues/40252911#comment7
         await Promise.all(
-          Array.from(this.participants.values()).map((p) => p.setAudioOutput({ deviceId })),
+          Array.from(this.remoteParticipants.values()).map((p) => p.setAudioOutput({ deviceId })),
         );
       } catch (e) {
         this.options.audioOutput.deviceId = prevDeviceId;
         throw e;
       }
     }
+    if (needsUpdateWithoutTracks || kind === 'audiooutput') {
+      // if there are not active tracks yet or we're switching audiooutput, we need to manually update the active device map here as changing audio output won't result in a track restart
+      this.localParticipant.activeDeviceMap.set(
+        kind,
+        (kind === 'audiooutput' && this.options.audioOutput?.deviceId) || deviceId,
+      );
+      this.emit(RoomEvent.ActiveDeviceChanged, kind, deviceId);
+    }
+
+    return success;
   }
 
   private setupLocalParticipantEvents() {
     this.localParticipant
       .on(ParticipantEvent.ParticipantMetadataChanged, this.onLocalParticipantMetadataChanged)
       .on(ParticipantEvent.ParticipantNameChanged, this.onLocalParticipantNameChanged)
+      .on(ParticipantEvent.AttributesChanged, this.onLocalAttributesChanged)
       .on(ParticipantEvent.TrackMuted, this.onLocalTrackMuted)
       .on(ParticipantEvent.TrackUnmuted, this.onLocalTrackUnmuted)
       .on(ParticipantEvent.LocalTrackPublished, this.onLocalTrackPublished)
       .on(ParticipantEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished)
       .on(ParticipantEvent.ConnectionQualityChanged, this.onLocalConnectionQualityChanged)
       .on(ParticipantEvent.MediaDevicesError, this.onMediaDevicesError)
+      .on(ParticipantEvent.AudioStreamAcquired, this.startAudio)
+      .on(ParticipantEvent.ChatMessage, this.onLocalChatMessageSent)
       .on(
         ParticipantEvent.ParticipantPermissionsChanged,
         this.onLocalParticipantPermissionsChanged,
@@ -776,17 +1383,20 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     this.engine?.close();
     /* @ts-ignore */
     this.engine = undefined;
+    this.isResuming = false;
 
     // clear out existing remote participants, since they may have attached
     // the old engine
-    this.participants.clear();
+    this.remoteParticipants.clear();
+    this.sidToIdentity.clear();
+    this.bufferedEvents = [];
     this.maybeCreateEngine();
   }
 
   private onTrackAdded(
     mediaTrack: MediaStreamTrack,
     stream: MediaStream,
-    receiver?: RTCRtpReceiver,
+    receiver: RTCRtpReceiver,
   ) {
     // don't fire onSubscribed when connecting
     // WebRTC fires onTrack as soon as setRemoteDescription is called on the offer
@@ -809,19 +1419,33 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       return;
     }
     if (this.state === ConnectionState.Disconnected) {
-      log.warn('skipping incoming track after Room disconnected');
+      this.log.warn('skipping incoming track after Room disconnected', this.logContext);
       return;
     }
     const parts = unpackStreamId(stream.id);
-    const participantId = parts[0];
-    let trackId = parts[1];
-    if (!trackId || trackId === '') trackId = mediaTrack.id;
+    const participantSid = parts[0];
+    let streamId = parts[1];
+    let trackId = mediaTrack.id;
+    // firefox will get streamId (pID|trackId) instead of (pID|streamId) as it doesn't support sync tracks by stream
+    // and generates its own track id instead of infer from sdp track id.
+    if (streamId && streamId.startsWith('TR')) trackId = streamId;
 
-    if (participantId === this.localParticipant.sid) {
-      log.warn('tried to create RemoteParticipant for local participant');
+    if (participantSid === this.localParticipant.sid) {
+      this.log.warn('tried to create RemoteParticipant for local participant', this.logContext);
       return;
     }
-    const participant = this.getOrCreateParticipant(participantId);
+
+    const participant = Array.from(this.remoteParticipants.values()).find(
+      (p) => p.sid === participantSid,
+    ) as RemoteParticipant | undefined;
+
+    if (!participant) {
+      this.log.error(
+        `Tried to add a track for a participant, that's not present. Sid: ${participantSid}`,
+        this.logContext,
+      );
+      return;
+    }
 
     let adaptiveStreamSettings: AdaptiveStreamSettings | undefined;
     if (this.options.adaptiveStream) {
@@ -842,9 +1466,12 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
   private handleRestarting = () => {
     this.clearConnectionReconcile();
+    // in case we went from resuming to full-reconnect, make sure to reflect it on the isResuming flag
+    this.isResuming = false;
+
     // also unwind existing participants & existing subscriptions
-    for (const p of this.participants.values()) {
-      this.handleParticipantDisconnected(p.sid, p);
+    for (const p of this.remoteParticipants.values()) {
+      this.handleParticipantDisconnected(p.identity, p);
     }
 
     if (this.setAndEmitConnectionState(ConnectionState.Reconnecting)) {
@@ -853,52 +1480,28 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   };
 
   private handleSignalRestarted = async (joinResponse: JoinResponse) => {
-    log.debug(`signal reconnected to server`, {
+    this.log.debug(`signal reconnected to server, region ${joinResponse.serverRegion}`, {
+      ...this.logContext,
       region: joinResponse.serverRegion,
     });
+    this.bufferedEvents = [];
 
-    this.cachedParticipantSids = [];
     this.applyJoinResponse(joinResponse);
 
     try {
       // unpublish & republish tracks
-      const localPubs: LocalTrackPublication[] = [];
-      this.localParticipant.tracks.forEach((pub) => {
-        if (pub.track) {
-          localPubs.push(pub);
-        }
-      });
-
-      await Promise.all(
-        localPubs.map(async (pub) => {
-          const track = pub.track!;
-          this.localParticipant.unpublishTrack(track, false);
-          if (!track.isMuted) {
-            if (
-              (track instanceof LocalAudioTrack || track instanceof LocalVideoTrack) &&
-              !track.isUserProvided
-            ) {
-              // we need to restart the track before publishing, often a full reconnect
-              // is necessary because computer had gone to sleep.
-              log.debug('restarting existing track', {
-                track: pub.trackSid,
-              });
-              await track.restartTrack();
-            }
-            log.debug('publishing new track', {
-              track: pub.trackSid,
-            });
-            await this.localParticipant.publishTrack(track, pub.options);
-          }
-        }),
-      );
+      await this.localParticipant.republishAllTracks(undefined, true);
     } catch (error) {
-      log.error('error trying to re-publish tracks after reconnection', { error });
+      this.log.error('error trying to re-publish tracks after reconnection', {
+        ...this.logContext,
+        error,
+      });
     }
 
     try {
       await this.engine.waitForRestarted();
-      log.debug(`fully reconnected to server`, {
+      this.log.debug(`fully reconnected to server`, {
+        ...this.logContext,
         region: joinResponse.serverRegion,
       });
     } catch {
@@ -908,63 +1511,71 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     this.setAndEmitConnectionState(ConnectionState.Connected);
     this.emit(RoomEvent.Reconnected);
     this.registerConnectionReconcile();
-
-    // emit participant connected events after connection has been re-established
-    this.participants.forEach((participant) => {
-      this.emit(RoomEvent.ParticipantConnected, participant);
-    });
+    this.emitBufferedEvents();
   };
 
   private handleDisconnect(shouldStopTracks = true, reason?: DisconnectReason) {
     this.clearConnectionReconcile();
+    this.isResuming = false;
+    this.bufferedEvents = [];
+    this.transcriptionReceivedTimes.clear();
     if (this.state === ConnectionState.Disconnected) {
       return;
     }
 
+    this.regionUrl = undefined;
+
     try {
-      this.participants.forEach((p) => {
-        p.tracks.forEach((pub) => {
+      this.remoteParticipants.forEach((p) => {
+        p.trackPublications.forEach((pub) => {
           p.unpublishTrack(pub.trackSid);
         });
       });
 
-      this.localParticipant.tracks.forEach((pub) => {
+      this.localParticipant.trackPublications.forEach((pub) => {
         if (pub.track) {
           this.localParticipant.unpublishTrack(pub.track, shouldStopTracks);
         }
         if (shouldStopTracks) {
           pub.track?.detach();
           pub.track?.stop();
+        } else {
+          pub.track?.stopMonitor();
         }
       });
 
       this.localParticipant
         .off(ParticipantEvent.ParticipantMetadataChanged, this.onLocalParticipantMetadataChanged)
         .off(ParticipantEvent.ParticipantNameChanged, this.onLocalParticipantNameChanged)
+        .off(ParticipantEvent.AttributesChanged, this.onLocalAttributesChanged)
         .off(ParticipantEvent.TrackMuted, this.onLocalTrackMuted)
         .off(ParticipantEvent.TrackUnmuted, this.onLocalTrackUnmuted)
         .off(ParticipantEvent.LocalTrackPublished, this.onLocalTrackPublished)
         .off(ParticipantEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished)
         .off(ParticipantEvent.ConnectionQualityChanged, this.onLocalConnectionQualityChanged)
         .off(ParticipantEvent.MediaDevicesError, this.onMediaDevicesError)
+        .off(ParticipantEvent.AudioStreamAcquired, this.startAudio)
+        .off(ParticipantEvent.ChatMessage, this.onLocalChatMessageSent)
         .off(
           ParticipantEvent.ParticipantPermissionsChanged,
           this.onLocalParticipantPermissionsChanged,
         );
 
-      this.localParticipant.tracks.clear();
-      this.localParticipant.videoTracks.clear();
-      this.localParticipant.audioTracks.clear();
+      this.localParticipant.trackPublications.clear();
+      this.localParticipant.videoTrackPublications.clear();
+      this.localParticipant.audioTrackPublications.clear();
 
-      this.participants.clear();
+      this.remoteParticipants.clear();
+      this.sidToIdentity.clear();
       this.activeSpeakers = [];
-      if (this.audioContext && typeof this.options.expWebAudioMix === 'boolean') {
+      if (this.audioContext && typeof this.options.webAudioMix === 'boolean') {
         this.audioContext.close();
         this.audioContext = undefined;
       }
       if (isWeb()) {
         window.removeEventListener('beforeunload', this.onPageLeave);
         window.removeEventListener('pagehide', this.onPageLeave);
+        window.removeEventListener('freeze', this.onPageLeave);
         navigator.mediaDevices?.removeEventListener('devicechange', this.handleDeviceChange);
       }
     } finally {
@@ -981,42 +1592,36 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         return;
       }
 
-      // ensure identity <=> sid mapping
-      const sid = this.identityToSid.get(info.identity);
-      if (sid && sid !== info.sid) {
-        // sid had changed, need to remove previous participant
-        this.handleParticipantDisconnected(sid, this.participants.get(sid));
+      // LiveKit server doesn't send identity info prior to version 1.5.2 in disconnect updates
+      // so we try to map an empty identity to an already known sID manually
+      if (info.identity === '') {
+        info.identity = this.sidToIdentity.get(info.sid) ?? '';
       }
 
-      let remoteParticipant = this.participants.get(info.sid);
-      const isNewParticipant = !remoteParticipant;
+      let remoteParticipant = this.remoteParticipants.get(info.identity);
 
       // when it's disconnected, send updates
       if (info.state === ParticipantInfo_State.DISCONNECTED) {
-        this.handleParticipantDisconnected(info.sid, remoteParticipant);
+        this.handleParticipantDisconnected(info.identity, remoteParticipant);
       } else {
         // create participant if doesn't exist
-        remoteParticipant = this.getOrCreateParticipant(info.sid, info);
-        if (!isNewParticipant) {
-          // just update, no events
-          remoteParticipant.updateInfo(info);
-        }
+        remoteParticipant = this.getOrCreateParticipant(info.identity, info);
       }
     });
   };
 
-  private handleParticipantDisconnected(sid: string, participant?: RemoteParticipant) {
+  private handleParticipantDisconnected(identity: string, participant?: RemoteParticipant) {
     // remove and send event
-    this.participants.delete(sid);
+    this.remoteParticipants.delete(identity);
     if (!participant) {
       return;
     }
 
-    this.identityToSid.delete(participant.identity);
-    participant.tracks.forEach((publication) => {
+    participant.trackPublications.forEach((publication) => {
       participant.unpublishTrack(publication.trackSid, true);
     });
     this.emit(RoomEvent.ParticipantDisconnected, participant);
+    this.localParticipant?.handleParticipantDisconnected(participant.identity);
   }
 
   // updates are sent only when there's a change to speaker ordering
@@ -1030,7 +1635,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         this.localParticipant.setIsSpeaking(true);
         activeSpeakers.push(this.localParticipant);
       } else {
-        const p = this.participants.get(speaker.sid);
+        const p = this.getRemoteParticipantBySid(speaker.sid);
         if (p) {
           p.audioLevel = speaker.level;
           p.setIsSpeaking(true);
@@ -1043,7 +1648,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       this.localParticipant.audioLevel = 0;
       this.localParticipant.setIsSpeaking(false);
     }
-    this.participants.forEach((p) => {
+    this.remoteParticipants.forEach((p) => {
       if (!seenSids[p.sid]) {
         p.audioLevel = 0;
         p.setIsSpeaking(false);
@@ -1058,10 +1663,14 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   private handleSpeakersChanged = (speakerUpdates: SpeakerInfo[]) => {
     const lastSpeakers = new Map<string, Participant>();
     this.activeSpeakers.forEach((p) => {
+      const remoteParticipant = this.remoteParticipants.get(p.identity);
+      if (remoteParticipant && remoteParticipant.sid !== p.sid) {
+        return;
+      }
       lastSpeakers.set(p.sid, p);
     });
     speakerUpdates.forEach((speaker) => {
-      let p: Participant | undefined = this.participants.get(speaker.sid);
+      let p: Participant | undefined = this.getRemoteParticipantBySid(speaker.sid);
       if (speaker.sid === this.localParticipant.sid) {
         p = this.localParticipant;
       }
@@ -1085,31 +1694,34 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
   private handleStreamStateUpdate = (streamStateUpdate: StreamStateUpdate) => {
     streamStateUpdate.streamStates.forEach((streamState) => {
-      const participant = this.participants.get(streamState.participantSid);
+      const participant = this.getRemoteParticipantBySid(streamState.participantSid);
       if (!participant) {
         return;
       }
-      const pub = participant.getTrackPublication(streamState.trackSid);
+      const pub = participant.getTrackPublicationBySid(streamState.trackSid);
       if (!pub || !pub.track) {
         return;
       }
-      pub.track.streamState = Track.streamStateFromProto(streamState.state);
-      participant.emit(ParticipantEvent.TrackStreamStateChanged, pub, pub.track.streamState);
-      this.emitWhenConnected(
-        RoomEvent.TrackStreamStateChanged,
-        pub,
-        pub.track.streamState,
-        participant,
-      );
+      const newStreamState = Track.streamStateFromProto(streamState.state);
+      if (newStreamState !== pub.track.streamState) {
+        pub.track.streamState = newStreamState;
+        participant.emit(ParticipantEvent.TrackStreamStateChanged, pub, pub.track.streamState);
+        this.emitWhenConnected(
+          RoomEvent.TrackStreamStateChanged,
+          pub,
+          pub.track.streamState,
+          participant,
+        );
+      }
     });
   };
 
   private handleSubscriptionPermissionUpdate = (update: SubscriptionPermissionUpdate) => {
-    const participant = this.participants.get(update.participantSid);
+    const participant = this.getRemoteParticipantBySid(update.participantSid);
     if (!participant) {
       return;
     }
-    const pub = participant.getTrackPublication(update.trackSid);
+    const pub = participant.getTrackPublicationBySid(update.trackSid);
     if (!pub) {
       return;
     }
@@ -1118,13 +1730,13 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   };
 
   private handleSubscriptionError = (update: SubscriptionResponse) => {
-    const participant = Array.from(this.participants.values()).find((p) =>
-      p.tracks.has(update.trackSid),
+    const participant = Array.from(this.remoteParticipants.values()).find((p) =>
+      p.trackPublications.has(update.trackSid),
     );
     if (!participant) {
       return;
     }
-    const pub = participant.getTrackPublication(update.trackSid);
+    const pub = participant.getTrackPublicationBySid(update.trackSid);
     if (!pub) {
       return;
     }
@@ -1132,14 +1744,197 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     pub.setSubscriptionError(update.err);
   };
 
-  private handleDataPacket = (userPacket: UserPacket, kind: DataPacket_Kind) => {
+  private handleDataPacket = (packet: DataPacket) => {
     // find the participant
-    const participant = this.participants.get(userPacket.participantSid);
+    const participant = this.remoteParticipants.get(packet.participantIdentity);
+    if (packet.value.case === 'user') {
+      this.handleUserPacket(participant, packet.value.value, packet.kind);
+    } else if (packet.value.case === 'transcription') {
+      this.handleTranscription(participant, packet.value.value);
+    } else if (packet.value.case === 'sipDtmf') {
+      this.handleSipDtmf(participant, packet.value.value);
+    } else if (packet.value.case === 'chatMessage') {
+      this.handleChatMessage(participant, packet.value.value);
+    } else if (packet.value.case === 'metrics') {
+      this.handleMetrics(packet.value.value, participant);
+    } else if (packet.value.case === 'streamHeader') {
+      this.handleStreamHeader(packet.value.value, packet.participantIdentity);
+    } else if (packet.value.case === 'streamChunk') {
+      this.handleStreamChunk(packet.value.value);
+    } else if (packet.value.case === 'streamTrailer') {
+      this.handleStreamTrailer(packet.value.value);
+    } else if (packet.value.case === 'rpcRequest') {
+      const rpc = packet.value.value;
+      this.handleIncomingRpcRequest(
+        packet.participantIdentity,
+        rpc.id,
+        rpc.method,
+        rpc.payload,
+        rpc.responseTimeoutMs,
+        rpc.version,
+      );
+    }
+  };
 
+  private async handleStreamHeader(streamHeader: DataStream_Header, participantIdentity: string) {
+    if (streamHeader.contentHeader.case === 'byteHeader') {
+      const streamHandlerCallback = this.byteStreamHandlers.get(streamHeader.topic);
+
+      if (!streamHandlerCallback) {
+        this.log.debug(
+          'ignoring incoming byte stream due to no handler for topic',
+          streamHeader.topic,
+        );
+        return;
+      }
+      let streamController: ReadableStreamDefaultController<DataStream_Chunk>;
+      const info: ByteStreamInfo = {
+        id: streamHeader.streamId,
+        name: streamHeader.contentHeader.value.name ?? 'unknown',
+        mimeType: streamHeader.mimeType,
+        size: streamHeader.totalLength ? Number(streamHeader.totalLength) : undefined,
+        topic: streamHeader.topic,
+        timestamp: bigIntToNumber(streamHeader.timestamp),
+        attributes: streamHeader.attributes,
+      };
+      const stream = new ReadableStream({
+        start: (controller) => {
+          streamController = controller;
+          this.byteStreamControllers.set(streamHeader.streamId, {
+            info,
+            controller: streamController,
+            startTime: Date.now(),
+          });
+        },
+      });
+      streamHandlerCallback(
+        new ByteStreamReader(info, stream, bigIntToNumber(streamHeader.totalLength)),
+        {
+          identity: participantIdentity,
+        },
+      );
+    } else if (streamHeader.contentHeader.case === 'textHeader') {
+      const streamHandlerCallback = this.textStreamHandlers.get(streamHeader.topic);
+
+      if (!streamHandlerCallback) {
+        this.log.debug(
+          'ignoring incoming text stream due to no handler for topic',
+          streamHeader.topic,
+        );
+        return;
+      }
+      let streamController: ReadableStreamDefaultController<DataStream_Chunk>;
+      const info: TextStreamInfo = {
+        id: streamHeader.streamId,
+        mimeType: streamHeader.mimeType,
+        size: streamHeader.totalLength ? Number(streamHeader.totalLength) : undefined,
+        topic: streamHeader.topic,
+        timestamp: Number(streamHeader.timestamp),
+        attributes: streamHeader.attributes,
+      };
+
+      const stream = new ReadableStream<DataStream_Chunk>({
+        start: (controller) => {
+          streamController = controller;
+          this.textStreamControllers.set(streamHeader.streamId, {
+            info,
+            controller: streamController,
+            startTime: Date.now(),
+          });
+        },
+      });
+      streamHandlerCallback(
+        new TextStreamReader(info, stream, bigIntToNumber(streamHeader.totalLength)),
+        { identity: participantIdentity },
+      );
+    }
+  }
+
+  private handleStreamChunk(chunk: DataStream_Chunk) {
+    const fileBuffer = this.byteStreamControllers.get(chunk.streamId);
+    if (fileBuffer) {
+      if (chunk.content.length > 0) {
+        fileBuffer.controller.enqueue(chunk);
+      }
+    }
+    const textBuffer = this.textStreamControllers.get(chunk.streamId);
+    if (textBuffer) {
+      if (chunk.content.length > 0) {
+        textBuffer.controller.enqueue(chunk);
+      }
+    }
+  }
+
+  private handleStreamTrailer(trailer: DataStream_Trailer) {
+    const textBuffer = this.textStreamControllers.get(trailer.streamId);
+
+    if (textBuffer) {
+      textBuffer.info.attributes = {
+        ...textBuffer.info.attributes,
+        ...trailer.attributes,
+      };
+      textBuffer.controller.close();
+      this.byteStreamControllers.delete(trailer.streamId);
+    }
+
+    const fileBuffer = this.byteStreamControllers.get(trailer.streamId);
+    if (fileBuffer) {
+      {
+        fileBuffer.info.attributes = { ...fileBuffer.info.attributes, ...trailer.attributes };
+        fileBuffer.controller.close();
+        this.byteStreamControllers.delete(trailer.streamId);
+      }
+    }
+  }
+
+  private handleUserPacket = (
+    participant: RemoteParticipant | undefined,
+    userPacket: UserPacket,
+    kind: DataPacket_Kind,
+  ) => {
     this.emit(RoomEvent.DataReceived, userPacket.payload, participant, kind, userPacket.topic);
 
     // also emit on the participant
     participant?.emit(ParticipantEvent.DataReceived, userPacket.payload, kind);
+  };
+
+  private handleSipDtmf = (participant: RemoteParticipant | undefined, dtmf: SipDTMF) => {
+    this.emit(RoomEvent.SipDTMFReceived, dtmf, participant);
+
+    // also emit on the participant
+    participant?.emit(ParticipantEvent.SipDTMFReceived, dtmf);
+  };
+
+  bufferedSegments: Map<string, TranscriptionSegmentModel> = new Map();
+
+  private handleTranscription = (
+    _remoteParticipant: RemoteParticipant | undefined,
+    transcription: TranscriptionModel,
+  ) => {
+    // find the participant
+    const participant =
+      transcription.transcribedParticipantIdentity === this.localParticipant.identity
+        ? this.localParticipant
+        : this.getParticipantByIdentity(transcription.transcribedParticipantIdentity);
+    const publication = participant?.trackPublications.get(transcription.trackId);
+
+    const segments = extractTranscriptionSegments(transcription, this.transcriptionReceivedTimes);
+
+    publication?.emit(TrackEvent.TranscriptionReceived, segments);
+    participant?.emit(ParticipantEvent.TranscriptionReceived, segments, publication);
+    this.emit(RoomEvent.TranscriptionReceived, segments, participant, publication);
+  };
+
+  private handleChatMessage = (
+    participant: RemoteParticipant | undefined,
+    chatMessage: ChatMessageModel,
+  ) => {
+    const msg = extractChatMessage(chatMessage);
+    this.emit(RoomEvent.ChatMessage, msg, participant);
+  };
+
+  private handleMetrics = (metrics: MetricsBatch, participant?: Participant) => {
+    this.emit(RoomEvent.MetricsReceived, metrics, participant);
   };
 
   private handleAudioPlaybackStarted = () => {
@@ -1151,7 +1946,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   };
 
   private handleAudioPlaybackFailed = (e: any) => {
-    log.warn('could not playback audio', e);
+    this.log.warn('could not playback audio', { ...this.logContext, error: e });
     if (!this.canPlaybackAudio) {
       return;
     }
@@ -1159,7 +1954,77 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     this.emit(RoomEvent.AudioPlaybackStatusChanged, false);
   };
 
+  private handleVideoPlaybackStarted = () => {
+    if (this.isVideoPlaybackBlocked) {
+      this.isVideoPlaybackBlocked = false;
+      this.emit(RoomEvent.VideoPlaybackStatusChanged, true);
+    }
+  };
+
+  private handleVideoPlaybackFailed = () => {
+    if (!this.isVideoPlaybackBlocked) {
+      this.isVideoPlaybackBlocked = true;
+      this.emit(RoomEvent.VideoPlaybackStatusChanged, false);
+    }
+  };
+
   private handleDeviceChange = async () => {
+    const previousDevices = DeviceManager.getInstance().previousDevices;
+    // check for available devices, but don't request permissions in order to avoid prompts for kinds that haven't been used before
+    const availableDevices = await DeviceManager.getInstance().getDevices(undefined, false);
+    const browser = getBrowser();
+    if (browser?.name === 'Chrome' && browser.os !== 'iOS') {
+      for (let availableDevice of availableDevices) {
+        const previousDevice = previousDevices.find(
+          (info) => info.deviceId === availableDevice.deviceId,
+        );
+        if (
+          previousDevice &&
+          previousDevice.label !== '' &&
+          previousDevice.kind === availableDevice.kind &&
+          previousDevice.label !== availableDevice.label
+        ) {
+          // label has changed on device the same deviceId, indicating that the default device has changed on the OS level
+          if (this.getActiveDevice(availableDevice.kind) === 'default') {
+            // emit an active device change event only if the selected output device is actually on `default`
+            this.emit(
+              RoomEvent.ActiveDeviceChanged,
+              availableDevice.kind,
+              availableDevice.deviceId,
+            );
+          }
+        }
+      }
+    }
+
+    // inputs are automatically handled via TrackEvent.Ended causing a TrackEvent.Restarted. Here we only need to worry about audiooutputs changing
+    const kinds: MediaDeviceKind[] = ['audiooutput', 'audioinput', 'videoinput'];
+    for (let kind of kinds) {
+      const devicesOfKind = availableDevices.filter((d) => d.kind === kind);
+      const activeDevice = this.getActiveDevice(kind);
+
+      if (activeDevice === previousDevices.filter((info) => info.kind === kind)[0]?.deviceId) {
+        // in  Safari the first device is always the default, so we assume a user on the default device would like to switch to the default once it changes
+        // FF doesn't emit an event when the default device changes, so we perform the same best effort and switch to the new device once connected and if it's the first in the array
+        if (devicesOfKind.length > 0 && devicesOfKind[0]?.deviceId !== activeDevice) {
+          await this.switchActiveDevice(kind, devicesOfKind[0].deviceId);
+          continue;
+        }
+      }
+
+      if ((kind === 'audioinput' && !isSafari()) || kind === 'videoinput') {
+        // airpods on Safari need special handling for audioinput as the track doesn't end as soon as you take them out
+        continue;
+      }
+      // switch to first available device if previously active device is not available any more
+      if (
+        devicesOfKind.length > 0 &&
+        !devicesOfKind.find((deviceInfo) => deviceInfo.deviceId === this.getActiveDevice(kind))
+      ) {
+        await this.switchActiveDevice(kind, devicesOfKind[0].deviceId);
+      }
+    }
+
     this.emit(RoomEvent.MediaDevicesChanged);
   };
 
@@ -1180,7 +2045,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         this.localParticipant.setConnectionQuality(info.quality);
         return;
       }
-      const participant = this.participants.get(info.participantSid);
+      const participant = this.getRemoteParticipantBySid(info.participantSid);
       if (participant) {
         participant.setConnectionQuality(info.quality);
       }
@@ -1188,21 +2053,31 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   };
 
   private async acquireAudioContext() {
-    if (
-      typeof this.options.expWebAudioMix !== 'boolean' &&
-      this.options.expWebAudioMix.audioContext
-    ) {
+    if (typeof this.options.webAudioMix !== 'boolean' && this.options.webAudioMix.audioContext) {
       // override audio context with custom audio context if supplied by user
-      this.audioContext = this.options.expWebAudioMix.audioContext;
-      await this.audioContext.resume();
-    } else {
+      this.audioContext = this.options.webAudioMix.audioContext;
+    } else if (!this.audioContext || this.audioContext.state === 'closed') {
       // by using an AudioContext, it reduces lag on audio elements
       // https://stackoverflow.com/questions/9811429/html5-audio-tag-on-safari-has-a-delay/54119854#54119854
       this.audioContext = getNewAudioContext() ?? undefined;
     }
 
-    if (this.options.expWebAudioMix) {
-      this.participants.forEach((participant) => participant.setAudioContext(this.audioContext));
+    if (this.options.webAudioMix) {
+      this.remoteParticipants.forEach((participant) =>
+        participant.setAudioContext(this.audioContext),
+      );
+    }
+
+    this.localParticipant.setAudioContext(this.audioContext);
+
+    if (this.audioContext && this.audioContext.state === 'suspended') {
+      // for iOS a newly created AudioContext is always in `suspended` state.
+      // we try our best to resume the context here, if that doesn't work, we just continue with regular processing
+      try {
+        await Promise.race([this.audioContext.resume(), sleep(200)]);
+      } catch (e: any) {
+        this.log.warn('Could not resume audio context', { ...this.logContext, error: e });
+      }
     }
 
     const newContextIsRunning = this.audioContext?.state === 'running';
@@ -1212,33 +2087,56 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     }
   }
 
-  private createParticipant(id: string, info?: ParticipantInfo): RemoteParticipant {
+  private createParticipant(identity: string, info?: ParticipantInfo): RemoteParticipant {
     let participant: RemoteParticipant;
     if (info) {
-      participant = RemoteParticipant.fromParticipantInfo(this.engine.client, info);
+      participant = RemoteParticipant.fromParticipantInfo(this.engine.client, info, {
+        loggerContextCb: () => this.logContext,
+        loggerName: this.options.loggerName,
+      });
     } else {
-      participant = new RemoteParticipant(this.engine.client, id, '', undefined, undefined);
+      participant = new RemoteParticipant(
+        this.engine.client,
+        '',
+        identity,
+        undefined,
+        undefined,
+        undefined,
+        {
+          loggerContextCb: () => this.logContext,
+          loggerName: this.options.loggerName,
+        },
+      );
     }
-    if (this.options.expWebAudioMix) {
+    if (this.options.webAudioMix) {
       participant.setAudioContext(this.audioContext);
+    }
+    if (this.options.audioOutput?.deviceId) {
+      participant
+        .setAudioOutput(this.options.audioOutput)
+        .catch((e) => this.log.warn(`Could not set audio output: ${e.message}`, this.logContext));
     }
     return participant;
   }
 
-  private getOrCreateParticipant(id: string, info?: ParticipantInfo): RemoteParticipant {
-    if (this.participants.has(id)) {
-      return this.participants.get(id) as RemoteParticipant;
+  private getOrCreateParticipant(identity: string, info: ParticipantInfo): RemoteParticipant {
+    if (this.remoteParticipants.has(identity)) {
+      const existingParticipant = this.remoteParticipants.get(identity)!;
+      if (info) {
+        const wasUpdated = existingParticipant.updateInfo(info);
+        if (wasUpdated) {
+          this.sidToIdentity.set(info.sid, info.identity);
+        }
+      }
+      return existingParticipant;
     }
-    // it's possible for the RTC track to arrive before signaling data
-    // when this happens, we'll create the participant and make the track work
-    const participant = this.createParticipant(id, info);
-    this.participants.set(id, participant);
-    if (info) {
-      this.identityToSid.set(info.identity, info.sid);
-      // if we have valid info and the participant wasn't in the map before, we can assume the participant is new
-      // firing here to make sure that `ParticipantConnected` fires before the initial track events
-      this.emitWhenConnected(RoomEvent.ParticipantConnected, participant);
-    }
+    const participant = this.createParticipant(identity, info);
+    this.remoteParticipants.set(identity, participant);
+
+    this.sidToIdentity.set(info.sid, info.identity);
+    // if we have valid info and the participant wasn't in the map before, we can assume the participant is new
+    // firing here to make sure that `ParticipantConnected` fires before the initial track events
+    this.emitWhenConnected(RoomEvent.ParticipantConnected, participant);
 
     // also forward events
     // trackPublished is only fired for tracks added after both local participant
@@ -1254,6 +2152,9 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
           if (track.kind === Track.Kind.Audio) {
             track.on(TrackEvent.AudioPlaybackStarted, this.handleAudioPlaybackStarted);
             track.on(TrackEvent.AudioPlaybackFailed, this.handleAudioPlaybackFailed);
+          } else if (track.kind === Track.Kind.Video) {
+            track.on(TrackEvent.VideoPlaybackFailed, this.handleVideoPlaybackFailed);
+            track.on(TrackEvent.VideoPlaybackStarted, this.handleVideoPlaybackStarted);
           }
           this.emit(RoomEvent.TrackSubscribed, track, publication, participant);
         },
@@ -1267,9 +2168,6 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
           this.emit(RoomEvent.TrackUnsubscribed, track, publication, participant);
         },
       )
-      .on(ParticipantEvent.TrackSubscriptionFailed, (sid: string) => {
-        this.emit(RoomEvent.TrackSubscriptionFailed, sid, participant);
-      })
       .on(ParticipantEvent.TrackMuted, (pub: TrackPublication) => {
         this.emitWhenConnected(RoomEvent.TrackMuted, pub, participant);
       })
@@ -1281,6 +2179,13 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       })
       .on(ParticipantEvent.ParticipantNameChanged, (name) => {
         this.emitWhenConnected(RoomEvent.ParticipantNameChanged, name, participant);
+      })
+      .on(ParticipantEvent.AttributesChanged, (changedAttributes: Record<string, string>) => {
+        this.emitWhenConnected(
+          RoomEvent.ParticipantAttributesChanged,
+          changedAttributes,
+          participant,
+        );
       })
       .on(ParticipantEvent.ConnectionQualityChanged, (quality: ConnectionQuality) => {
         this.emitWhenConnected(RoomEvent.ConnectionQualityChanged, quality, participant);
@@ -1318,49 +2223,12 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   }
 
   private sendSyncState() {
-    if (
-      this.engine.subscriber === undefined ||
-      this.engine.subscriber.pc.localDescription === null
-    ) {
-      return;
-    }
-    const previousAnswer = this.engine.subscriber.pc.localDescription;
-    const previousOffer = this.engine.subscriber.pc.remoteDescription;
-
-    /* 1. autosubscribe on, so subscribed tracks = all tracks - unsub tracks,
-          in this case, we send unsub tracks, so server add all tracks to this
-          subscribe pc and unsub special tracks from it.
-       2. autosubscribe off, we send subscribed tracks.
-    */
-    const autoSubscribe = this.connOptions?.autoSubscribe ?? true;
-    const trackSids = new Array<string>();
-    this.participants.forEach((participant) => {
-      participant.tracks.forEach((track) => {
-        if (track.isDesired !== autoSubscribe) {
-          trackSids.push(track.trackSid);
-        }
-      });
-    });
-
-    this.engine.client.sendSyncState({
-      answer: toProtoSessionDescription({
-        sdp: previousAnswer.sdp,
-        type: previousAnswer.type,
-      }),
-      offer: previousOffer
-        ? toProtoSessionDescription({
-            sdp: previousOffer.sdp,
-            type: previousOffer.type,
-          })
-        : undefined,
-      subscription: {
-        trackSids,
-        subscribe: !autoSubscribe,
-        participantTracks: [],
-      },
-      publishTracks: this.localParticipant.publishedTracksInfo(),
-      dataChannels: this.localParticipant.dataChannelsInfo(),
-    });
+    const remoteTracks = Array.from(this.remoteParticipants.values()).reduce((acc, participant) => {
+      acc.push(...(participant.getTrackPublications() as RemoteTrackPublication[])); // FIXME would be nice to have this return RemoteTrackPublications directly instead of the type cast
+      return acc;
+    }, [] as RemoteTrackPublication[]);
+    const localTracks = this.localParticipant.getTrackPublications() as LocalTrackPublication[]; // FIXME would be nice to have this return LocalTrackPublications directly instead of the type cast
+    this.engine.sendSyncState(remoteTracks, localTracks);
   }
 
   /**
@@ -1368,12 +2236,19 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
    * subscription settings.
    */
   private updateSubscriptions() {
-    for (const p of this.participants.values()) {
-      for (const pub of p.videoTracks.values()) {
-        if (pub.isSubscribed && pub instanceof RemoteTrackPublication) {
+    for (const p of this.remoteParticipants.values()) {
+      for (const pub of p.videoTrackPublications.values()) {
+        if (pub.isSubscribed && isRemotePub(pub)) {
           pub.emitTrackUpdate();
         }
       }
+    }
+  }
+
+  private getRemoteParticipantBySid(sid: string): RemoteParticipant | undefined {
+    const identity = this.sidToIdentity.get(sid);
+    if (identity) {
+      return this.remoteParticipants.get(identity);
     }
   }
 
@@ -1390,7 +2265,16 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         !this.engine.verifyTransport()
       ) {
         consecutiveFailures++;
-        log.warn('detected connection state mismatch', { numFailures: consecutiveFailures });
+        this.log.warn('detected connection state mismatch', {
+          ...this.logContext,
+          numFailures: consecutiveFailures,
+          engine: this.engine
+            ? {
+                closed: this.engine.isClosed,
+                transportsConnected: this.engine.verifyTransport(),
+              }
+            : undefined,
+        });
         if (consecutiveFailures >= 3) {
           this.recreateEngine();
           this.handleDisconnect(
@@ -1420,11 +2304,26 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     return true;
   }
 
+  private emitBufferedEvents() {
+    this.bufferedEvents.forEach(([ev, args]) => {
+      this.emit(ev, ...args);
+    });
+    this.bufferedEvents = [];
+  }
+
   private emitWhenConnected<E extends keyof RoomEventCallbacks>(
     event: E,
     ...args: Parameters<RoomEventCallbacks[E]>
   ): boolean {
-    if (this.state === ConnectionState.Connected) {
+    if (
+      this.state === ConnectionState.Reconnecting ||
+      this.isResuming ||
+      !this.engine ||
+      this.engine.pendingReconnect
+    ) {
+      // in case the room is reconnecting, buffer the events by firing them later after emitting RoomEvent.Reconnected
+      this.bufferedEvents.push([event, args]);
+    } else if (this.state === ConnectionState.Connected) {
       return this.emit(event, ...args);
     }
     return false;
@@ -1438,6 +2337,10 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     this.emit(RoomEvent.ParticipantNameChanged, name, this.localParticipant);
   };
 
+  private onLocalAttributesChanged = (changedAttributes: Record<string, string>) => {
+    this.emit(RoomEvent.ParticipantAttributesChanged, changedAttributes, this.localParticipant);
+  };
+
   private onLocalTrackMuted = (pub: TrackPublication) => {
     this.emit(RoomEvent.TrackMuted, pub, this.localParticipant);
   };
@@ -1446,18 +2349,56 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     this.emit(RoomEvent.TrackUnmuted, pub, this.localParticipant);
   };
 
+  private onTrackProcessorUpdate = (processor?: TrackProcessor<Track.Kind, any>) => {
+    processor?.onPublish?.(this);
+  };
+
   private onLocalTrackPublished = async (pub: LocalTrackPublication) => {
+    pub.track?.on(TrackEvent.TrackProcessorUpdate, this.onTrackProcessorUpdate);
+    pub.track?.on(TrackEvent.Restarted, this.onLocalTrackRestarted);
+    pub.track?.getProcessor()?.onPublish?.(this);
+
     this.emit(RoomEvent.LocalTrackPublished, pub, this.localParticipant);
-    if (pub.track instanceof LocalAudioTrack) {
+
+    if (isLocalAudioTrack(pub.track)) {
       const trackIsSilent = await pub.track.checkForSilence();
       if (trackIsSilent) {
         this.emit(RoomEvent.LocalAudioSilenceDetected, pub);
       }
     }
+    const deviceId = await pub.track?.getDeviceId(false);
+    const deviceKind = sourceToKind(pub.source);
+    if (
+      deviceKind &&
+      deviceId &&
+      deviceId !== this.localParticipant.activeDeviceMap.get(deviceKind)
+    ) {
+      this.localParticipant.activeDeviceMap.set(deviceKind, deviceId);
+      this.emit(RoomEvent.ActiveDeviceChanged, deviceKind, deviceId);
+    }
   };
 
   private onLocalTrackUnpublished = (pub: LocalTrackPublication) => {
+    pub.track?.off(TrackEvent.TrackProcessorUpdate, this.onTrackProcessorUpdate);
+    pub.track?.off(TrackEvent.Restarted, this.onLocalTrackRestarted);
     this.emit(RoomEvent.LocalTrackUnpublished, pub, this.localParticipant);
+  };
+
+  private onLocalTrackRestarted = async (track: LocalTrack) => {
+    const deviceId = await track.getDeviceId(false);
+    const deviceKind = sourceToKind(track.source);
+    if (
+      deviceKind &&
+      deviceId &&
+      deviceId !== this.localParticipant.activeDeviceMap.get(deviceKind)
+    ) {
+      this.log.debug(
+        `local track restarted, setting ${deviceKind} ${deviceId} active`,
+        this.logContext,
+      );
+      this.localParticipant.activeDeviceMap.set(deviceKind, deviceId);
+      this.emit(RoomEvent.ActiveDeviceChanged, deviceKind, deviceId);
+    }
   };
 
   private onLocalConnectionQualityChanged = (quality: ConnectionQuality) => {
@@ -1470,6 +2411,10 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 
   private onLocalParticipantPermissionsChanged = (prevPermissions?: ParticipantPermission) => {
     this.emit(RoomEvent.ParticipantPermissionsChanged, prevPermissions, this.localParticipant);
+  };
+
+  private onLocalChatMessageSent = (msg: ChatMessage) => {
+    this.emit(RoomEvent.ChatMessage, msg, this.localParticipant);
   };
 
   /**
@@ -1492,22 +2437,22 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
       ...options.participants,
     };
     this.handleDisconnect();
-    this.roomInfo = {
+    this.roomInfo = new RoomModel({
       sid: 'RM_SIMULATED',
       name: 'simulated-room',
       emptyTimeout: 0,
       maxParticipants: 0,
-      creationTime: new Date().getTime(),
+      creationTime: protoInt64.parse(new Date().getTime()),
       metadata: '',
       numParticipants: 1,
       numPublishers: 1,
       turnPassword: '',
       enabledCodecs: [],
       activeRecording: false,
-    };
+    });
 
     this.localParticipant.updateInfo(
-      ParticipantInfo.fromPartial({
+      new ParticipantInfo({
         identity: 'simulated-local',
         name: 'local-name',
       }),
@@ -1519,7 +2464,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     if (publishOptions.video) {
       const camPub = new LocalTrackPublication(
         Track.Kind.Video,
-        TrackInfo.fromPartial({
+        new TrackInfo({
           source: TrackSource.CAMERA,
           sid: Math.floor(Math.random() * 10_000).toString(),
           type: TrackType.AUDIO,
@@ -1527,14 +2472,20 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
         }),
         new LocalVideoTrack(
           publishOptions.useRealTracks
-            ? (await navigator.mediaDevices.getUserMedia({ video: true })).getVideoTracks()[0]
+            ? (
+                await window.navigator.mediaDevices.getUserMedia({ video: true })
+              ).getVideoTracks()[0]
             : createDummyVideoStreamTrack(
-                160 * participantOptions.aspectRatios[0] ?? 1,
+                160 * (participantOptions.aspectRatios[0] ?? 1),
                 160,
                 true,
                 true,
               ),
+          undefined,
+          false,
+          { loggerName: this.options.loggerName, loggerContextCb: () => this.logContext },
         ),
+        { loggerName: this.options.loggerName, loggerContextCb: () => this.logContext },
       );
       // @ts-ignore
       this.localParticipant.addTrackPublication(camPub);
@@ -1543,7 +2494,7 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     if (publishOptions.audio) {
       const audioPub = new LocalTrackPublication(
         Track.Kind.Audio,
-        TrackInfo.fromPartial({
+        new TrackInfo({
           source: TrackSource.MICROPHONE,
           sid: Math.floor(Math.random() * 10_000).toString(),
           type: TrackType.AUDIO,
@@ -1552,7 +2503,12 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
           publishOptions.useRealTracks
             ? (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0]
             : getEmptyAudioStreamTrack(),
+          undefined,
+          false,
+          this.audioContext,
+          { loggerName: this.options.loggerName, loggerContextCb: () => this.logContext },
         ),
+        { loggerName: this.options.loggerName, loggerContextCb: () => this.logContext },
       );
       // @ts-ignore
       this.localParticipant.addTrackPublication(audioPub);
@@ -1560,37 +2516,47 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
     }
 
     for (let i = 0; i < participantOptions.count - 1; i += 1) {
-      let info: ParticipantInfo = ParticipantInfo.fromPartial({
+      let info: ParticipantInfo = new ParticipantInfo({
         sid: Math.floor(Math.random() * 10_000).toString(),
         identity: `simulated-${i}`,
         state: ParticipantInfo_State.ACTIVE,
         tracks: [],
-        joinedAt: Date.now(),
+        joinedAt: protoInt64.parse(Date.now()),
       });
       const p = this.getOrCreateParticipant(info.identity, info);
       if (participantOptions.video) {
         const dummyVideo = createDummyVideoStreamTrack(
-          160 * participantOptions.aspectRatios[i % participantOptions.aspectRatios.length] ?? 1,
+          160 * (participantOptions.aspectRatios[i % participantOptions.aspectRatios.length] ?? 1),
           160,
           false,
           true,
         );
-        const videoTrack = TrackInfo.fromPartial({
+        const videoTrack = new TrackInfo({
           source: TrackSource.CAMERA,
           sid: Math.floor(Math.random() * 10_000).toString(),
           type: TrackType.AUDIO,
         });
-        p.addSubscribedMediaTrack(dummyVideo, videoTrack.sid, new MediaStream([dummyVideo]));
+        p.addSubscribedMediaTrack(
+          dummyVideo,
+          videoTrack.sid,
+          new MediaStream([dummyVideo]),
+          new RTCRtpReceiver(),
+        );
         info.tracks = [...info.tracks, videoTrack];
       }
       if (participantOptions.audio) {
         const dummyTrack = getEmptyAudioStreamTrack();
-        const audioTrack = TrackInfo.fromPartial({
+        const audioTrack = new TrackInfo({
           source: TrackSource.MICROPHONE,
           sid: Math.floor(Math.random() * 10_000).toString(),
           type: TrackType.AUDIO,
         });
-        p.addSubscribedMediaTrack(dummyTrack, audioTrack.sid, new MediaStream([dummyTrack]));
+        p.addSubscribedMediaTrack(
+          dummyTrack,
+          audioTrack.sid,
+          new MediaStream([dummyTrack]),
+          new RTCRtpReceiver(),
+        );
         info.tracks = [...info.tracks, audioTrack];
       }
 
@@ -1605,10 +2571,27 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
   ): boolean {
     // active speaker updates are too spammy
     if (event !== RoomEvent.ActiveSpeakersChanged) {
-      log.debug(`room event ${event}`, { event, args });
+      // only extract logContext from arguments in order to avoid logging the whole object tree
+      const minimizedArgs = mapArgs(args).filter((arg: unknown) => arg !== undefined);
+      this.log.debug(`room event ${event}`, { ...this.logContext, event, args: minimizedArgs });
     }
     return super.emit(event, ...args);
   }
+}
+
+function mapArgs(args: unknown[]): any {
+  return args.map((arg: unknown) => {
+    if (!arg) {
+      return;
+    }
+    if (Array.isArray(arg)) {
+      return mapArgs(arg);
+    }
+    if (typeof arg === 'object') {
+      return 'logContext' in arg ? arg.logContext : undefined;
+    }
+    return arg;
+  });
 }
 
 export default Room;
@@ -1616,10 +2599,9 @@ export default Room;
 export type RoomEventCallbacks = {
   connected: () => void;
   reconnecting: () => void;
+  signalReconnecting: () => void;
   reconnected: () => void;
   disconnected: (reason?: DisconnectReason) => void;
-  /** @deprecated stateChanged has been renamed to connectionStateChanged */
-  stateChanged: (state: ConnectionState) => void;
   connectionStateChanged: (state: ConnectionState) => void;
   mediaDevicesChanged: () => void;
   participantConnected: (participant: RemoteParticipant) => void;
@@ -1658,6 +2640,10 @@ export type RoomEventCallbacks = {
     prevPermissions: ParticipantPermission | undefined,
     participant: RemoteParticipant | LocalParticipant,
   ) => void;
+  participantAttributesChanged: (
+    changedAttributes: Record<string, string>,
+    participant: RemoteParticipant | LocalParticipant,
+  ) => void;
   activeSpeakersChanged: (speakers: Array<Participant>) => void;
   roomMetadataChanged: (metadata: string) => void;
   dataReceived: (
@@ -1665,6 +2651,12 @@ export type RoomEventCallbacks = {
     participant?: RemoteParticipant,
     kind?: DataPacket_Kind,
     topic?: string,
+  ) => void;
+  sipDTMFReceived: (dtmf: SipDTMF, participant?: RemoteParticipant) => void;
+  transcriptionReceived: (
+    transcription: TranscriptionSegment[],
+    participant?: Participant,
+    publication?: TrackPublication,
   ) => void;
   connectionQualityChanged: (quality: ConnectionQuality, participant: Participant) => void;
   mediaDevicesError: (error: Error) => void;
@@ -1684,7 +2676,14 @@ export type RoomEventCallbacks = {
     participant: RemoteParticipant,
   ) => void;
   audioPlaybackChanged: (playing: boolean) => void;
+  videoPlaybackChanged: (playing: boolean) => void;
   signalConnected: () => void;
   recordingStatusChanged: (recording: boolean) => void;
+  participantEncryptionStatusChanged: (encrypted: boolean, participant?: Participant) => void;
+  encryptionError: (error: Error) => void;
   dcBufferStatusChanged: (isLow: boolean, kind: DataPacket_Kind) => void;
+  activeDeviceChanged: (kind: MediaDeviceKind, deviceId: string) => void;
+  chatMessage: (message: ChatMessage, participant?: RemoteParticipant | LocalParticipant) => void;
+  localTrackSubscribed: (publication: LocalTrackPublication, participant: LocalParticipant) => void;
+  metricsReceived: (metrics: MetricsBatch, participant?: Participant) => void;
 };
