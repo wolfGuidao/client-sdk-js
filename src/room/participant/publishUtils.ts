@@ -1,27 +1,38 @@
 import log from '../../logger';
+import { getBrowser } from '../../utils/browserParser';
 import { TrackInvalidError } from '../errors';
 import LocalAudioTrack from '../track/LocalAudioTrack';
 import LocalVideoTrack from '../track/LocalVideoTrack';
 import { Track } from '../track/Track';
-import { ScreenSharePresets, VideoPreset, VideoPresets, VideoPresets43 } from '../track/options';
 import type {
   BackupVideoCodec,
   TrackPublishOptions,
   VideoCodec,
   VideoEncoding,
 } from '../track/options';
-import { getReactNativeOs, isReactNative, isSVCCodec } from '../utils';
+import { ScreenSharePresets, VideoPreset, VideoPresets, VideoPresets43 } from '../track/options';
+import type { LoggerOptions } from '../types';
+import {
+  compareVersions,
+  getReactNativeOs,
+  isFireFox,
+  isReactNative,
+  isSVCCodec,
+  isSafari,
+  unwrapConstraint,
+} from '../utils';
 
 /** @internal */
 export function mediaTrackToLocalTrack(
   mediaStreamTrack: MediaStreamTrack,
   constraints?: MediaTrackConstraints,
+  loggerOptions?: LoggerOptions,
 ): LocalVideoTrack | LocalAudioTrack {
   switch (mediaStreamTrack.kind) {
     case 'audio':
-      return new LocalAudioTrack(mediaStreamTrack, constraints, false);
+      return new LocalAudioTrack(mediaStreamTrack, constraints, false, undefined, loggerOptions);
     case 'video':
-      return new LocalVideoTrack(mediaStreamTrack, constraints, false);
+      return new LocalVideoTrack(mediaStreamTrack, constraints, false, loggerOptions);
     default:
       throw new TrackInvalidError(`unsupported track type: ${mediaStreamTrack.kind}`);
   }
@@ -44,7 +55,7 @@ export const defaultSimulcastPresets43 = [VideoPresets43.h180, VideoPresets43.h3
 
 /* @internal */
 export const computeDefaultScreenShareSimulcastPresets = (fromPreset: VideoPreset) => {
-  const layers = [{ scaleResolutionDownBy: 2, fps: 3 }];
+  const layers = [{ scaleResolutionDownBy: 2, fps: fromPreset.encoding.maxFramerate }];
   return layers.map(
     (t) =>
       new VideoPreset(
@@ -54,7 +65,8 @@ export const computeDefaultScreenShareSimulcastPresets = (fromPreset: VideoPrese
           150_000,
           Math.floor(
             fromPreset.encoding.maxBitrate /
-              (t.scaleResolutionDownBy ** 2 * ((fromPreset.encoding.maxFramerate ?? 30) / t.fps)),
+              (t.scaleResolutionDownBy ** 2 *
+                ((fromPreset.encoding.maxFramerate ?? 30) / (t.fps ?? 30))),
           ),
         ),
         t.fps,
@@ -113,16 +125,17 @@ export function computeVideoEncodings(
     log.debug('using video encoding', videoEncoding);
   }
 
+  const sourceFramerate = videoEncoding.maxFramerate;
+
   const original = new VideoPreset(
     width,
     height,
     videoEncoding.maxBitrate,
     videoEncoding.maxFramerate,
+    videoEncoding.priority,
   );
 
   if (scalabilityMode && isSVCCodec(videoCodec)) {
-    log.debug(`using svc with scalabilityMode ${scalabilityMode}`);
-
     const sm = new ScalabilityMode(scalabilityMode);
 
     const encodings: RTCRtpEncodingParameters[] = [];
@@ -130,17 +143,47 @@ export function computeVideoEncodings(
     if (sm.spatial > 3) {
       throw new Error(`unsupported scalabilityMode: ${scalabilityMode}`);
     }
-    for (let i = 0; i < sm.spatial; i += 1) {
+    // Before M113 in Chrome, defining multiple encodings with an SVC codec indicated
+    // that SVC mode should be used. Safari still works this way.
+    // This is a bit confusing but is due to how libwebrtc interpreted the encodings field
+    // before M113.
+    // Announced here: https://groups.google.com/g/discuss-webrtc/c/-QQ3pxrl-fw?pli=1
+    const browser = getBrowser();
+    if (
+      isSafari() ||
+      // Even tho RN runs M114, it does not produce SVC layers when a single encoding
+      // is provided. So we'll use the legacy SVC specification for now.
+      // TODO: when we upstream libwebrtc, this will need additional verification
+      isReactNative() ||
+      (browser?.name === 'Chrome' && compareVersions(browser?.version, '113') < 0)
+    ) {
+      const bitratesRatio = sm.suffix == 'h' ? 2 : 3;
+      for (let i = 0; i < sm.spatial; i += 1) {
+        // in legacy SVC, scaleResolutionDownBy cannot be set
+        encodings.push({
+          rid: videoRids[2 - i],
+          maxBitrate: videoEncoding.maxBitrate / bitratesRatio ** i,
+          maxFramerate: original.encoding.maxFramerate,
+        });
+      }
+      // legacy SVC, scalabilityMode is set only on the first encoding
+      /* @ts-ignore */
+      encodings[0].scalabilityMode = scalabilityMode;
+    } else {
       encodings.push({
-        rid: videoRids[2 - i],
-        maxBitrate: videoEncoding.maxBitrate / 3 ** i,
-        /* @ts-ignore */
+        maxBitrate: videoEncoding.maxBitrate,
         maxFramerate: original.encoding.maxFramerate,
+        /* @ts-ignore */
+        scalabilityMode: scalabilityMode,
       });
     }
-    /* @ts-ignore */
-    encodings[0].scalabilityMode = scalabilityMode;
-    log.debug('encodings', encodings);
+
+    if (original.encoding.priority) {
+      encodings[0].priority = original.encoding.priority;
+      encodings[0].networkPriority = original.encoding.priority;
+    }
+
+    log.debug(`using svc encoding`, { encodings });
     return encodings;
   }
 
@@ -170,15 +213,15 @@ export function computeVideoEncodings(
     //      to disable when CPU constrained.
     //      So encodings should be ordered in increasing spatial
     //      resolution order.
-    //   2. ion-sfu translates rids into layers. So, all encodings
+    //   2. livekit-server translates rids into layers. So, all encodings
     //      should have the base layer `q` and then more added
     //      based on other conditions.
     const size = Math.max(width, height);
     if (size >= 960 && midPreset) {
-      return encodingsFromPresets(width, height, [lowPreset, midPreset, original]);
+      return encodingsFromPresets(width, height, [lowPreset, midPreset, original], sourceFramerate);
     }
     if (size >= 480) {
-      return encodingsFromPresets(width, height, [lowPreset, original]);
+      return encodingsFromPresets(width, height, [lowPreset, original], sourceFramerate);
     }
   }
   return encodingsFromPresets(width, height, [original]);
@@ -189,7 +232,12 @@ export function computeTrackBackupEncodings(
   videoCodec: BackupVideoCodec,
   opts: TrackPublishOptions,
 ) {
-  if (!opts.backupCodec || opts.backupCodec.codec === opts.videoCodec) {
+  // backupCodec should not be true anymore, default codec is set in LocalParticipant.publish
+  if (
+    !opts.backupCodec ||
+    opts.backupCodec === true ||
+    opts.backupCodec.codec === opts.videoCodec
+  ) {
     // backup codec publishing is disabled
     return;
   }
@@ -208,6 +256,10 @@ export function computeTrackBackupEncodings(
   const width = settings.width ?? track.dimensions?.width;
   const height = settings.height ?? track.dimensions?.height;
 
+  // disable simulcast for screenshare backup codec since L1Tx is used by primary codec
+  if (track.source === Track.Source.ScreenShare && opts.simulcast) {
+    opts.simulcast = false;
+  }
   const encodings = computeVideoEncodings(
     track.source === Track.Source.ScreenShare,
     width,
@@ -237,9 +289,12 @@ export function determineAppropriateEncoding(
       break;
     }
   }
+
   // presets are based on the assumption of vp8 as a codec
   // for other codecs we adjust the maxBitrate if no specific videoEncoding has been provided
-  // TODO make the bitrate multipliers configurable per codec
+  // users should override these with ones that are optimized for their use case
+  // NOTE: SVC codec bitrates are inclusive of all scalability layers. while
+  // bitrate for non-SVC codecs does not include other simulcast layers.
   if (codec) {
     switch (codec) {
       case 'av1':
@@ -295,6 +350,7 @@ function encodingsFromPresets(
   width: number,
   height: number,
   presets: VideoPreset[],
+  sourceFramerate?: number | undefined,
 ): RTCRtpEncodingParameters[] {
   const encodings: RTCRtpEncodingParameters[] = [];
   presets.forEach((preset, idx) => {
@@ -303,15 +359,23 @@ function encodingsFromPresets(
     }
     const size = Math.min(width, height);
     const rid = videoRids[idx];
+
     const encoding: RTCRtpEncodingParameters = {
       rid,
       scaleResolutionDownBy: Math.max(1, size / Math.min(preset.width, preset.height)),
       maxBitrate: preset.encoding.maxBitrate,
     };
-    if (preset.encoding.maxFramerate) {
-      encoding.maxFramerate = preset.encoding.maxFramerate;
+    // ensure that the sourceFramerate is the highest framerate applied across all layers so that the
+    // original encoding doesn't get bumped unintentionally by any of the other layers
+    const maxFramerate =
+      sourceFramerate && preset.encoding.maxFramerate
+        ? Math.min(sourceFramerate, preset.encoding.maxFramerate)
+        : preset.encoding.maxFramerate;
+    if (maxFramerate) {
+      encoding.maxFramerate = maxFramerate;
     }
-    if (preset.encoding.priority) {
+    const canSetPriority = isFireFox() || idx === 0;
+    if (preset.encoding.priority && canSetPriority) {
       encoding.priority = preset.encoding.priority;
       encoding.networkPriority = preset.encoding.priority;
     }
@@ -393,5 +457,19 @@ export class ScalabilityMode {
 
   toString(): string {
     return `L${this.spatial}T${this.temporal}${this.suffix ?? ''}`;
+  }
+}
+
+export function getDefaultDegradationPreference(track: LocalVideoTrack): RTCDegradationPreference {
+  // a few of reasons we have different default paths:
+  // 1. without this, Chrome seems to aggressively resize the SVC video stating `quality-limitation: bandwidth` even when BW isn't an issue
+  // 2. since we are overriding contentHint to motion (to workaround L1T3 publishing), it overrides the default degradationPreference to `balanced`
+  if (
+    track.source === Track.Source.ScreenShare ||
+    (track.constraints.height && unwrapConstraint(track.constraints.height) >= 1080)
+  ) {
+    return 'maintain-resolution';
+  } else {
+    return 'balanced';
   }
 }

@@ -1,4 +1,9 @@
 import type { Track } from './Track';
+import type {
+  AudioProcessorOptions,
+  TrackProcessor,
+  VideoProcessorOptions,
+} from './processor/types';
 
 export interface TrackPublishDefaults {
   /**
@@ -7,9 +12,30 @@ export interface TrackPublishDefaults {
   videoEncoding?: VideoEncoding;
 
   /**
-   * @experimental
+   * Advanced codecs (VP9/AV1/H265) are not supported by all browser clients. When backupCodec is
+   * set, when an incompatible client attempts to subscribe to the track, LiveKit
+   * will automatically publish a secondary track encoded with the backup codec.
+   *
+   * You could customize specific encoding parameters of the backup track by
+   * explicitly setting codec and encoding fields.
+   *
+   * Defaults to `true`
    */
-  backupCodec?: { codec: BackupVideoCodec; encoding: VideoEncoding } | false;
+  backupCodec?: true | false | { codec: BackupVideoCodec; encoding?: VideoEncoding };
+
+  /**
+   * When backup codec is enabled, there are two options to decide whether to
+   * send the primary codec at the same time:
+   *   * codec regression: publisher stops sending primary codec and all subscribers
+   *       will receive backup codec even if the primary codec is supported on their browser. It is the default
+   *       behavior and provides maximum compatibility. It also reduces CPU
+   *       and bandwidth consumption for publisher.
+   *   * multi-codec simulcast: publisher encodes and sends both codecs at same time,
+   *       subscribers will get most efficient codec. It will provide most bandwidth
+   *       efficiency, especially in the large 1:N room but requires more device performance
+   *       and bandwidth consumption for publisher.
+   */
+  backupCodecPolicy?: BackupCodecPolicy;
 
   /**
    * encoding parameters for screen share track
@@ -21,12 +47,6 @@ export interface TrackPublishDefaults {
    * as backup. (TBD)
    */
   videoCodec?: VideoCodec;
-
-  /**
-   * max audio bitrate, defaults to [[AudioPresets.music]]
-   * @deprecated use `audioPreset` instead
-   */
-  audioBitrate?: number;
 
   /**
    * which audio preset should be used for publishing (audio) tracks
@@ -45,7 +65,7 @@ export interface TrackPublishDefaults {
   red?: boolean;
 
   /**
-   * stereo audio track. defaults determined by capture channel count.
+   * publish track in stereo mode (or set to false to disable). defaults determined by capture channel count.
    */
   forceStereo?: boolean;
 
@@ -57,10 +77,15 @@ export interface TrackPublishDefaults {
   simulcast?: boolean;
 
   /**
-   * scalability mode for svc codecs, defaults to 'L3T3'.
+   * scalability mode for svc codecs, defaults to 'L3T3_KEY'.
    * for svc codecs, simulcast is disabled.
    */
   scalabilityMode?: ScalabilityMode;
+
+  /**
+   * degradation preference
+   */
+  degradationPreference?: RTCDegradationPreference;
 
   /**
    * Up to two additional simulcast layers to publish in addition to the original
@@ -109,6 +134,13 @@ export interface TrackPublishOptions extends TrackPublishDefaults {
    * Source of track, camera, microphone, or screen
    */
   source?: Track.Source;
+
+  /**
+   * Set stream name for the track. Audio and video tracks with the same stream name
+   * will be placed in the same `MediaStream` and offer better synchronization.
+   * By default, camera and microphone will be placed in a stream; as would screen_share and screen_share_audio
+   */
+  stream?: string;
 }
 
 export interface CreateLocalTracksOptions {
@@ -138,6 +170,11 @@ export interface VideoCaptureOptions {
   facingMode?: 'user' | 'environment' | 'left' | 'right';
 
   resolution?: VideoResolution;
+
+  /**
+   * initialize the track with a given processor
+   */
+  processor?: TrackProcessor<Track.Kind.Video, VideoProcessorOptions>;
 }
 
 export interface ScreenShareCaptureOptions {
@@ -147,7 +184,18 @@ export interface ScreenShareCaptureOptions {
    */
   audio?: boolean | AudioCaptureOptions;
 
-  /** capture resolution, defaults to full HD */
+  /**
+   * only allows for 'true' and chrome allows for additional options to be passed in
+   * https://developer.chrome.com/docs/web-platform/screen-sharing-controls/#displaySurface
+   */
+  video?: true | { displaySurface?: 'window' | 'browser' | 'monitor' };
+
+  /**
+   * capture resolution, defaults to 1080 for all browsers other than Safari
+   * On Safari 17, default resolution is not capped, due to a bug, specifying
+   * any resolution at all would lead to a low-resolution capture.
+   * https://bugs.webkit.org/show_bug.cgi?id=263015
+   */
   resolution?: VideoResolution;
 
   /** a CaptureController object instance containing methods that can be used to further manipulate the capture session if included. */
@@ -162,11 +210,21 @@ export interface ScreenShareCaptureOptions {
   /** specifies whether the browser should include the system audio among the possible audio sources offered to the user */
   systemAudio?: 'include' | 'exclude';
 
+  /** specify the type of content, see: https://www.w3.org/TR/mst-content-hint/#video-content-hints */
+  contentHint?: 'detail' | 'text' | 'motion';
+
   /**
    * Experimental option to control whether the audio playing in a tab will continue to be played out of a user's
    * local speakers when the tab is captured.
    */
   suppressLocalAudioPlayback?: boolean;
+
+  /**
+   * Experimental option to instruct the browser to offer the current tab as the most prominent capture source
+   * @experimental
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia#prefercurrenttab
+   */
+  preferCurrentTab?: boolean;
 }
 
 export interface AudioCaptureOptions {
@@ -202,6 +260,14 @@ export interface AudioCaptureOptions {
   noiseSuppression?: ConstrainBoolean;
 
   /**
+   * @experimental
+   * a stronger version of 'noiseSuppression', browser support is not widespread yet.
+   * If this is set (and supported) the value for 'noiseSuppression' will be ignored
+   * @see https://w3c.github.io/mediacapture-extensions/#voiceisolation-constraint
+   */
+  voiceIsolation?: ConstrainBoolean;
+
+  /**
    * the sample rate or range of sample rates which are acceptable and/or required.
    */
   sampleRate?: ConstrainULong;
@@ -210,6 +276,11 @@ export interface AudioCaptureOptions {
    * sample size or range of sample sizes which are acceptable and/or required.
    */
   sampleSize?: ConstrainULong;
+
+  /**
+   * initialize the track with a given processor
+   */
+  processor?: TrackProcessor<Track.Kind.Audio, AudioProcessorOptions>;
 }
 
 export interface AudioOutputOptions {
@@ -234,6 +305,15 @@ export interface VideoEncoding {
   priority?: RTCPriorityType;
 }
 
+export interface VideoPresetOptions {
+  width: number;
+  height: number;
+  aspectRatio?: number;
+  maxBitrate: number;
+  maxFramerate?: number;
+  priority?: RTCPriorityType;
+}
+
 export class VideoPreset {
   encoding: VideoEncoding;
 
@@ -241,20 +321,44 @@ export class VideoPreset {
 
   height: number;
 
+  aspectRatio?: number;
+
+  constructor(videoPresetOptions: VideoPresetOptions);
   constructor(
     width: number,
     height: number,
     maxBitrate: number,
     maxFramerate?: number,
     priority?: RTCPriorityType,
+  );
+  constructor(
+    widthOrOptions: number | VideoPresetOptions,
+    height?: number,
+    maxBitrate?: number,
+    maxFramerate?: number,
+    priority?: RTCPriorityType,
   ) {
-    this.width = width;
-    this.height = height;
-    this.encoding = {
-      maxBitrate,
-      maxFramerate,
-      priority,
-    };
+    if (typeof widthOrOptions === 'object') {
+      this.width = widthOrOptions.width;
+      this.height = widthOrOptions.height;
+      this.aspectRatio = widthOrOptions.aspectRatio;
+      this.encoding = {
+        maxBitrate: widthOrOptions.maxBitrate,
+        maxFramerate: widthOrOptions.maxFramerate,
+        priority: widthOrOptions.priority,
+      };
+    } else if (height !== undefined && maxBitrate !== undefined) {
+      this.width = widthOrOptions;
+      this.height = height;
+      this.aspectRatio = widthOrOptions / height;
+      this.encoding = {
+        maxBitrate,
+        maxFramerate,
+        priority,
+      };
+    } else {
+      throw new TypeError('Unsupported options: provide at least width, height and maxBitrate');
+    }
   }
 
   get resolution(): VideoResolution {
@@ -262,7 +366,7 @@ export class VideoPreset {
       width: this.width,
       height: this.height,
       frameRate: this.encoding.maxFramerate,
-      aspectRatio: this.width / this.height,
+      aspectRatio: this.aspectRatio,
     };
   }
 }
@@ -272,10 +376,11 @@ export interface AudioPreset {
   priority?: RTCPriorityType;
 }
 
-const codecs = ['vp8', 'h264', 'vp9', 'av1'] as const;
 const backupCodecs = ['vp8', 'h264'] as const;
 
-export type VideoCodec = (typeof codecs)[number];
+export const videoCodecs = ['vp8', 'h264', 'vp9', 'av1'] as const;
+
+export type VideoCodec = (typeof videoCodecs)[number];
 
 export type BackupVideoCodec = (typeof backupCodecs)[number];
 
@@ -283,36 +388,55 @@ export function isBackupCodec(codec: string): codec is BackupVideoCodec {
   return !!backupCodecs.find((backup) => backup === codec);
 }
 
-export function isCodecEqual(c1: string | undefined, c2: string | undefined): boolean {
-  return (
-    c1?.toLowerCase().replace(/audio\/|video\//y, '') ===
-    c2?.toLowerCase().replace(/audio\/|video\//y, '')
-  );
+export enum BackupCodecPolicy {
+  REGRESSION = 0,
+  SIMULCAST = 1,
 }
 
 /**
- * scalability modes for svc, only supprot l3t3 now.
+ * scalability modes for svc.
  */
-export type ScalabilityMode = 'L3T3' | 'L3T3_KEY';
+export type ScalabilityMode =
+  | 'L1T1'
+  | 'L1T2'
+  | 'L1T3'
+  | 'L2T1'
+  | 'L2T1h'
+  | 'L2T1_KEY'
+  | 'L2T2'
+  | 'L2T2h'
+  | 'L2T2_KEY'
+  | 'L2T3'
+  | 'L2T3h'
+  | 'L2T3_KEY'
+  | 'L3T1'
+  | 'L3T1h'
+  | 'L3T1_KEY'
+  | 'L3T2'
+  | 'L3T2h'
+  | 'L3T2_KEY'
+  | 'L3T3'
+  | 'L3T3h'
+  | 'L3T3_KEY';
 
 export namespace AudioPresets {
   export const telephone: AudioPreset = {
     maxBitrate: 12_000,
   };
   export const speech: AudioPreset = {
-    maxBitrate: 20_000,
+    maxBitrate: 24_000,
   };
   export const music: AudioPreset = {
-    maxBitrate: 32_000,
-  };
-  export const musicStereo: AudioPreset = {
     maxBitrate: 48_000,
   };
-  export const musicHighQuality: AudioPreset = {
+  export const musicStereo: AudioPreset = {
     maxBitrate: 64_000,
   };
-  export const musicHighQualityStereo: AudioPreset = {
+  export const musicHighQuality: AudioPreset = {
     maxBitrate: 96_000,
+  };
+  export const musicHighQualityStereo: AudioPreset = {
+    maxBitrate: 128_000,
   };
 }
 
@@ -320,11 +444,11 @@ export namespace AudioPresets {
  * Sane presets for video resolution/encoding
  */
 export const VideoPresets = {
-  h90: new VideoPreset(160, 90, 60_000, 15),
-  h180: new VideoPreset(320, 180, 120_000, 15),
-  h216: new VideoPreset(384, 216, 180_000, 15),
-  h360: new VideoPreset(640, 360, 300_000, 20),
-  h540: new VideoPreset(960, 540, 600_000, 25),
+  h90: new VideoPreset(160, 90, 90_000, 20),
+  h180: new VideoPreset(320, 180, 160_000, 20),
+  h216: new VideoPreset(384, 216, 180_000, 20),
+  h360: new VideoPreset(640, 360, 450_000, 20),
+  h540: new VideoPreset(960, 540, 800_000, 25),
   h720: new VideoPreset(1280, 720, 1_700_000, 30),
   h1080: new VideoPreset(1920, 1080, 3_000_000, 30),
   h1440: new VideoPreset(2560, 1440, 5_000_000, 30),
@@ -335,21 +459,25 @@ export const VideoPresets = {
  * Four by three presets
  */
 export const VideoPresets43 = {
-  h120: new VideoPreset(160, 120, 80_000, 15),
-  h180: new VideoPreset(240, 180, 100_000, 15),
-  h240: new VideoPreset(320, 240, 150_000, 15),
-  h360: new VideoPreset(480, 360, 225_000, 20),
-  h480: new VideoPreset(640, 480, 300_000, 20),
-  h540: new VideoPreset(720, 540, 450_000, 25),
-  h720: new VideoPreset(960, 720, 1_500_000, 30),
-  h1080: new VideoPreset(1440, 1080, 2_500_000, 30),
-  h1440: new VideoPreset(1920, 1440, 3_500_000, 30),
+  h120: new VideoPreset(160, 120, 70_000, 20),
+  h180: new VideoPreset(240, 180, 125_000, 20),
+  h240: new VideoPreset(320, 240, 140_000, 20),
+  h360: new VideoPreset(480, 360, 330_000, 20),
+  h480: new VideoPreset(640, 480, 500_000, 20),
+  h540: new VideoPreset(720, 540, 600_000, 25),
+  h720: new VideoPreset(960, 720, 1_300_000, 30),
+  h1080: new VideoPreset(1440, 1080, 2_300_000, 30),
+  h1440: new VideoPreset(1920, 1440, 3_800_000, 30),
 } as const;
 
 export const ScreenSharePresets = {
   h360fps3: new VideoPreset(640, 360, 200_000, 3, 'medium'),
-  h720fps5: new VideoPreset(1280, 720, 400_000, 5, 'medium'),
-  h720fps15: new VideoPreset(1280, 720, 1_000_000, 15, 'medium'),
-  h1080fps15: new VideoPreset(1920, 1080, 1_500_000, 15, 'medium'),
-  h1080fps30: new VideoPreset(1920, 1080, 3_000_000, 30, 'medium'),
+  h360fps15: new VideoPreset(640, 360, 400_000, 15, 'medium'),
+  h720fps5: new VideoPreset(1280, 720, 800_000, 5, 'medium'),
+  h720fps15: new VideoPreset(1280, 720, 1_500_000, 15, 'medium'),
+  h720fps30: new VideoPreset(1280, 720, 2_000_000, 30, 'medium'),
+  h1080fps15: new VideoPreset(1920, 1080, 2_500_000, 15, 'medium'),
+  h1080fps30: new VideoPreset(1920, 1080, 5_000_000, 30, 'medium'),
+  // original resolution, without resizing
+  original: new VideoPreset(0, 0, 7_000_000, 30, 'medium'),
 } as const;
